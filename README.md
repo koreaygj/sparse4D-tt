@@ -19,7 +19,7 @@ Porting the Sparse4D v3 3D object detection model to Tenstorrent devices (Wormho
 - [ ] model module by module convert by tt-nn
   - [x] ResNet50
   - [x] FPN Neck
-  - [ ] DeformableFeature Aggregation
+  - [x] DeformableFeature Aggregation
   - [ ] MultiheadAttention
   - [ ] AsymmetricFFN
   - [ ] Instance Bank
