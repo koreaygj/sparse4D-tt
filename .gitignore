@@ -1,1 +1,21 @@
+__pycache__/
+*.pyc
+
+# Data & models
+nuscenes/
+sparse4d-pt/
+ckpt/
+*.pt
+*.pkl
+*.pth
+
+# TT-Metal generated files
+generated/
+
+# Debug scripts & artifacts
+debug/
+*.log
 *.json
+
+# Documents
+*.pdf
