@@ -120,7 +120,7 @@ class InstanceBank:
             )
 
             cached_anchor = ttnn.from_torch(
-                cached_anchor_pt.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+                cached_anchor_pt.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
             )
             cached_feature = self.cached_feature  # already on device
         else:
@@ -131,15 +131,16 @@ class InstanceBank:
 
         # Move to device
         instance_feature = ttnn.from_torch(
-            feature_tiled, layout=ttnn.TILE_LAYOUT, device=self.device
+            feature_tiled, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
         anchor = ttnn.from_torch(
-            anchor_tiled, layout=ttnn.TILE_LAYOUT, device=self.device
+            anchor_tiled, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
         time_interval = ttnn.from_torch(
             time_interval_pt.reshape(1, 1, 1, bs),
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
+            dtype=ttnn.float32,
         )
         time_interval = ttnn.reshape(time_interval, (bs,))
 
@@ -202,10 +203,10 @@ class InstanceBank:
 
         # Back to device
         instance_feature = ttnn.from_torch(
-            out_feature, layout=ttnn.TILE_LAYOUT, device=self.device
+            out_feature, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
         anchor = ttnn.from_torch(
-            out_anchor, layout=ttnn.TILE_LAYOUT, device=self.device
+            out_anchor, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
         return instance_feature, anchor
@@ -264,15 +265,16 @@ class InstanceBank:
         )
 
         self.cached_feature = ttnn.from_torch(
-            cached_feature, layout=ttnn.TILE_LAYOUT, device=self.device
+            cached_feature, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
         self.cached_anchor = ttnn.from_torch(
-            cached_anchor, layout=ttnn.TILE_LAYOUT, device=self.device
+            cached_anchor, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
         self.confidence = ttnn.from_torch(
             top_conf.reshape(1, 1, bs, self.num_temp_instances),
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
+            dtype=ttnn.float32,
         )
 
     @staticmethod
@@ -312,7 +314,10 @@ class InstanceBank:
 
         size = anchor[..., [W, L, H]]
 
-        # Rotate yaw
+        # Rotate yaw: matmul input is [cos, sin], output is [cos', sin']
+        # Note: result order is [cos', sin'] but anchor convention is SIN=6, COS=7.
+        # This is a known issue in the original Sparse4D (TODO: Fix bug comment).
+        # Kept as-is for compatibility with pretrained weights.
         yaw = torch.matmul(
             T[..., :2, :2],
             anchor[..., [COS_YAW, SIN_YAW], None],
