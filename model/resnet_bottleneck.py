@@ -203,12 +203,17 @@ class Conv2dOp:
         input_width: int,
         groups: int = 1,
         activation=None,
-        weights_dtype=ttnn.bfloat8_b,
+        weights_dtype=ttnn.float32,
         activation_dtype=ttnn.bfloat16,
         shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
         deallocate_activation: bool = False,
         act_block_h_override: int = 0,
         math_fidelity=ttnn.MathFidelity.LoFi,
+        fp32_dest_acc_en: bool = False,
+        math_approx_mode: bool = True,
+        reallocate_halo_output: bool = False,
+        enable_act_double_buffer: bool = False,
+        enable_weights_double_buffer: bool = False,
     ):
         self.device = device
         self.in_channels = in_channels
@@ -227,24 +232,33 @@ class Conv2dOp:
         self.compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=math_fidelity,
-            fp32_dest_acc_en=False,
+            fp32_dest_acc_en=fp32_dest_acc_en,
             packer_l1_acc=False,
-            math_approx_mode=True,
+            math_approx_mode=math_approx_mode,
         )
 
         self.conv_config = ttnn.Conv2dConfig(
             weights_dtype=weights_dtype,
             shard_layout=shard_layout,
             deallocate_activation=deallocate_activation,
-            enable_act_double_buffer=False,
+            enable_act_double_buffer=enable_act_double_buffer,
+            enable_weights_double_buffer=enable_weights_double_buffer,
             reshard_if_not_optimal=True,
+            reallocate_halo_output=reallocate_halo_output,
             activation=activation,
         )
         if act_block_h_override > 0:
             self.conv_config.act_block_h_override = act_block_h_override
 
+        # Auto-slice: if conv doesn't fit in L1, slice automatically
+        self.slice_config = ttnn.Conv2dL1FullSliceConfig
+
+    def disable_slice(self):
+        """Disable auto-slicing for convs that don't need it (e.g., conv1)."""
+        self.slice_config = None
+
     def __call__(self, x: ttnn.Tensor) -> Tuple[ttnn.Tensor, int, int]:
-        [x, [out_h, out_w], [self.weight, self.bias]] = ttnn.conv2d(
+        kwargs = dict(
             input_tensor=x,
             weight_tensor=self.weight,
             bias_tensor=self.bias,
@@ -263,6 +277,9 @@ class Conv2dOp:
             return_output_dim=True,
             return_weights_and_bias=True,
         )
+        if self.slice_config is not None:
+            kwargs["slice_config"] = self.slice_config
+        [x, [out_h, out_w], [self.weight, self.bias]] = ttnn.conv2d(**kwargs)
         return x, out_h, out_w
 
 
@@ -290,6 +307,8 @@ class Bottleneck:
         activation_dtype=ttnn.bfloat16,
         conv3_block_sharded: bool = False,
         downsample_block_sharded: bool = False,
+        math_fidelity=ttnn.MathFidelity.LoFi,
+        fp32_dest_acc_en: bool = False,
     ):
         self.device = device
         self.has_downsample = has_downsample
@@ -301,6 +320,12 @@ class Bottleneck:
         else:  # caffe
             conv1_stride = stride
             conv2_stride = 1
+
+        # Shard layout: HEIGHT for layer1-2, BLOCK for layer3-4
+        shard = (
+            ttnn.TensorMemoryLayout.BLOCK_SHARDED if conv3_block_sharded
+            else ttnn.TensorMemoryLayout.HEIGHT_SHARDED
+        )
 
         # conv1: 1x1 reduction
         s = shapes["conv1"]
@@ -315,6 +340,10 @@ class Bottleneck:
             input_height=s["input_height"],
             input_width=s["input_width"],
             activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
+            shard_layout=shard,
+            reallocate_halo_output=True,
+            math_fidelity=math_fidelity,
+            fp32_dest_acc_en=fp32_dest_acc_en,
         )
 
         # conv2: 3x3 spatial
@@ -332,14 +361,13 @@ class Bottleneck:
             activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
             deallocate_activation=True,
             act_block_h_override=32,
+            shard_layout=shard,
+            reallocate_halo_output=True,
+            math_fidelity=math_fidelity,
+            fp32_dest_acc_en=fp32_dest_acc_en,
         )
 
         # conv3: 1x1 expansion (no activation - added after residual)
-        # Use BLOCK_SHARDED for deeper layers to avoid L1 overflow with large channels
-        conv3_shard = (
-            ttnn.TensorMemoryLayout.BLOCK_SHARDED if conv3_block_sharded
-            else ttnn.TensorMemoryLayout.HEIGHT_SHARDED
-        )
         s = shapes["conv3"]
         self.conv3 = Conv2dOp(
             params["conv3"], device,
@@ -353,17 +381,15 @@ class Bottleneck:
             input_width=s["input_width"],
             activation=None,
             deallocate_activation=True,
-            shard_layout=conv3_shard,
+            shard_layout=shard,
+            reallocate_halo_output=True,
+            math_fidelity=math_fidelity,
+            fp32_dest_acc_en=fp32_dest_acc_en,
         )
 
-        # Downsample path
-        # Use BLOCK_SHARDED for deeper layers (layer3/4) where output channels
-        # are 1024/2048 and HEIGHT_SHARDED would exceed L1 per core
+        # Downsample path — use DRAM mode (shard_layout=None) to avoid
+        # L1 CB overflow with bfloat16 on large spatial (64x176, batch=6)
         if has_downsample:
-            ds_shard = (
-                ttnn.TensorMemoryLayout.BLOCK_SHARDED if downsample_block_sharded
-                else ttnn.TensorMemoryLayout.HEIGHT_SHARDED
-            )
             s = shapes["downsample"]
             self.downsample = Conv2dOp(
                 params["downsample"], device,
@@ -377,7 +403,12 @@ class Bottleneck:
                 input_width=s["input_width"],
                 activation=None,
                 activation_dtype=activation_dtype,
-                shard_layout=ds_shard,
+                shard_layout=None,
+                deallocate_activation=True,
+                reallocate_halo_output=True,
+                math_fidelity=math_fidelity,
+                fp32_dest_acc_en=fp32_dest_acc_en,
+                math_approx_mode=False,
             )
 
     def __call__(self, x_identity: ttnn.Tensor) -> ttnn.Tensor:
@@ -434,6 +465,8 @@ class ResLayer:
         activation_dtype=ttnn.bfloat16,
         conv3_block_sharded: bool = False,
         downsample_block_sharded: bool = False,
+        math_fidelity=ttnn.MathFidelity.LoFi,
+        fp32_dest_acc_en: bool = False,
     ):
         expansion = Bottleneck.expansion
         has_downsample = (stride != 1 or inplanes != planes * expansion)
@@ -459,6 +492,8 @@ class ResLayer:
                 activation_dtype=activation_dtype,
                 conv3_block_sharded=conv3_block_sharded,
                 downsample_block_sharded=downsample_block_sharded,
+                math_fidelity=math_fidelity,
+                fp32_dest_acc_en=fp32_dest_acc_en,
             )
         )
 
@@ -482,6 +517,8 @@ class ResLayer:
                     activation_dtype=activation_dtype,
                     conv3_block_sharded=conv3_block_sharded,
                     downsample_block_sharded=False,
+                    math_fidelity=math_fidelity,
+                    fp32_dest_acc_en=fp32_dest_acc_en,
                 )
             )
 
@@ -517,12 +554,14 @@ class TtResNetBottleneck:
         input_width: int = 704,
         out_indices: Tuple[int, ...] = (0, 1, 2, 3),
         style: str = "pytorch",
+        activation_dtype=ttnn.bfloat16,
     ):
         self.device = device
         self.batch_size = batch_size
         self.input_height = input_height
         self.input_width = input_width
         self.out_indices = out_indices
+        self.activation_dtype = activation_dtype
 
         # Conv1: 7x7, stride 2, padding 3
         conv1_shapes = conv_shapes["conv1"]
@@ -537,10 +576,14 @@ class TtResNetBottleneck:
             input_height=conv1_shapes["input_height"],
             input_width=conv1_shapes["input_width"],
             activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
-            activation_dtype=ttnn.bfloat16,
+            activation_dtype=activation_dtype,
             act_block_h_override=64,
             deallocate_activation=True,
+            math_fidelity=ttnn.MathFidelity.HiFi4 if batch_size <= 3 else ttnn.MathFidelity.LoFi,
+            fp32_dest_acc_en=True,
+            math_approx_mode=False,
         )
+        self.conv1.disable_slice()  # conv1 doesn't need L1 slicing
 
         # Maxpool output dimensions
         self.maxpool_output_height = (input_height // 2 - 3 + 2 * 1) // 2 + 1  # (128-3+2)/2+1=64
@@ -563,6 +606,14 @@ class TtResNetBottleneck:
             # Use block sharding for deeper layers with large output channels
             use_block_shard = (i >= 2)  # layer3 (1024ch) and layer4 (2048ch)
 
+            # Use fp32 dest accumulator for deeper layers where spatial is smaller
+            # and L1 can accommodate the extra buffer
+            # fp32 dest acc fits L1 at batch<=3 but exceeds at batch=6
+            use_fp32_acc = (batch_size <= 3)
+
+            # HiFi4 when fp32 acc is available, HiFi2 otherwise
+            fidelity = ttnn.MathFidelity.HiFi4 if use_fp32_acc else ttnn.MathFidelity.HiFi2
+
             layer = ResLayer(
                 params=params[f"layer{i + 1}"],
                 shapes=layer_shapes,
@@ -572,9 +623,11 @@ class TtResNetBottleneck:
                 num_blocks=num_blocks,
                 stride=stride,
                 style=style,
-                activation_dtype=ttnn.bfloat8_b if i == 1 else ttnn.bfloat16,
+                activation_dtype=activation_dtype,
                 conv3_block_sharded=use_block_shard,
                 downsample_block_sharded=use_block_shard,
+                math_fidelity=fidelity,
+                fp32_dest_acc_en=use_fp32_acc,
             )
             self.res_layers.append(layer)
             inplanes = planes * Bottleneck.expansion
@@ -617,7 +670,7 @@ class TtResNetBottleneck:
 
         # Convert to interleaved for maxpool
         x = ttnn.sharded_to_interleaved(x)
-        x = ttnn.add(x, 0.0, dtype=ttnn.bfloat8_b)
+        x = ttnn.add(x, 0.0, dtype=self.activation_dtype)
 
         logger.debug(f"==== maxpool (3x3, stride 2), input: {out_h}x{out_w}")
         x = ttnn.max_pool2d(
@@ -633,15 +686,14 @@ class TtResNetBottleneck:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             ceil_mode=False,
         )
-
         # Run residual layers and collect outputs
         outs = []
         for i, layer in enumerate(self.res_layers):
             logger.debug(f"==== layer{i + 1}")
             x = layer(x)
             if i == 0:
-                # Convert to bfloat8_b after layer1 for memory efficiency
-                x = ttnn.add(x, 0.0, dtype=ttnn.bfloat8_b)
+                # Keep activation dtype for detection precision
+                x = ttnn.add(x, 0.0, dtype=self.activation_dtype)
             if i in self.out_indices:
                 outs.append(x)
 
@@ -660,6 +712,7 @@ def create_tt_resnet_bottleneck(
     input_width: int = 704,
     out_indices: Tuple[int, ...] = (0, 1, 2, 3),
     style: str = "pytorch",
+    activation_dtype=ttnn.bfloat16,
 ) -> Tuple[TtResNetBottleneck, dict]:
     """Create a TTNN ResNet50 Bottleneck model from a PyTorch ResNet50.
 
@@ -684,6 +737,7 @@ def create_tt_resnet_bottleneck(
         input_width=input_width,
         out_indices=out_indices,
         style=style,
+        activation_dtype=activation_dtype,
     )
 
     return tt_model, params
