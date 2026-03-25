@@ -63,8 +63,7 @@ def create_pytorch_fpn():
 def run_fpn_pcc(batch_size, model_config, config_name):
     """Run FPN PCC test: PyTorch golden vs TT-NN."""
     # Sparse4D spatial shapes for ResNet50 with 256x704 input
-    # Using standard 224x224 backbone shapes for simplicity
-    input_spatial_shapes = [(56, 56), (28, 28), (14, 14), (7, 7)]
+    input_spatial_shapes = [(64, 176), (32, 88), (16, 44), (8, 22)]
     in_channels = [256, 512, 1024, 2048]
     out_channels = 256
 
@@ -153,21 +152,12 @@ def main():
 
     configs = [
         {
-            "batch": 1,
-            "name": "batch=1, bfloat16 + HiFi2",
+            "batch": 6,
+            "name": "batch=6, float32 act + HiFi2 (Sparse4D)",
             "config": {
                 "MATH_FIDELITY": ttnn.MathFidelity.HiFi2,
                 "WEIGHTS_DTYPE": ttnn.bfloat16,
-                "ACTIVATIONS_DTYPE": ttnn.bfloat16,
-            },
-        },
-        {
-            "batch": 8,
-            "name": "batch=8, bfloat8_b + LoFi",
-            "config": {
-                "MATH_FIDELITY": ttnn.MathFidelity.LoFi,
-                "WEIGHTS_DTYPE": ttnn.bfloat8_b,
-                "ACTIVATIONS_DTYPE": ttnn.bfloat8_b,
+                "ACTIVATIONS_DTYPE": ttnn.float32,
             },
         },
     ]

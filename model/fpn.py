@@ -68,10 +68,9 @@ class FPN:
         compute_kernel_config = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=model_config["MATH_FIDELITY"],
-            # for fast math (should change if need to more accruarcy)
-            math_approx_mode=True,
-            fp32_dest_acc_en=False,
-            packer_l1_acc=True,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
         )
         self.compute_kernel_config = compute_kernel_config
 
@@ -114,9 +113,12 @@ class FPN:
             # Ensure on DRAM interleaved for conv2d input
             x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
 
-            # Use HEIGHT_SHARDED for large spatial, skip for small to avoid L1 clash
+            # Use HEIGHT_SHARDED only when shard fits in L1.
+            # Per-core shard = (total_rows / num_cores) × in_channels × dtype_size
+            # With bfloat16 input (2 bytes), 256ch × 1207 rows = 618KB/core → too much.
+            # Disable sharding for all lateral convs (in_channels >= 256).
             total_rows = self.batch_size * h * w
-            use_sharding = total_rows >= 128
+            use_sharding = total_rows >= 128 and self.in_channels[i] < 256
             conv_config = ttnn.Conv2dConfig(
                 weights_dtype=self.model_config["WEIGHTS_DTYPE"],
                 shard_layout=(
