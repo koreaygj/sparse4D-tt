@@ -47,6 +47,10 @@ class SparseBox3DRefinementModule:
     ) -> None:
         self.device = device
         self.embed_dims = embed_dims
+        self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
+            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+        )
         self.output_dim = output_dim
         self.num_cls = num_cls
         self.refine_yaw = refine_yaw
@@ -89,31 +93,45 @@ class SparseBox3DRefinementModule:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _run_layers(self, x: ttnn.Tensor, layers: list) -> ttnn.Tensor:
-        for entry in layers:
-            x = ttnn.linear(x, entry["weight"], bias=entry["bias"])
+        for idx, entry in enumerate(layers):
+            linear_in = x
+            x = ttnn.linear(x, entry["weight"], bias=entry["bias"], compute_kernel_config=self._hifi_compute_config)
+            relu_in = x
             x = ttnn.relu(x)
             if "ln_weight" in entry:
+                relu_out = x
                 x = ttnn.layer_norm(
-                    x, weight=entry["ln_weight"], bias=entry["ln_bias"]
+                    x, weight=entry["ln_weight"], bias=entry["ln_bias"],
+                    epsilon=1e-5,
+                    compute_kernel_config=self._hifi_compute_config,
                 )
+                ttnn.synchronize_device(self.device)
+                ttnn.deallocate(relu_in)
+                ttnn.deallocate(relu_out)
+            else:
+                ttnn.synchronize_device(self.device)
+                ttnn.deallocate(relu_in)
+            # Deallocate previous layer output (skip idx=0: caller owns input)
+            if idx > 0:
+                ttnn.deallocate(linear_in)
         return x
 
     def run(
@@ -148,53 +166,71 @@ class SparseBox3DRefinementModule:
 
         # --- Refine layers ---
         refined = self._run_layers(feature_flat, self.refine_layers)
+        refined_linear_in = refined
         refined = ttnn.linear(
-            refined, self.refine_final_weight, bias=self.refine_final_bias
+            refined, self.refine_final_weight, bias=self.refine_final_bias,
+            compute_kernel_config=self._hifi_compute_config,
         )
+        ttnn.deallocate(refined_linear_in)
         # Apply Scale
+        refined_pre_scale = refined
         refined = ttnn.multiply(refined, self.refine_scale)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(refined_pre_scale)
         refined = ttnn.reshape(refined, (bs, num_anchor, self.output_dim))
 
-        # Residual refinement: output[refine_state] += anchor[refine_state]
-        # For refine_yaw=True: indices [0,1,2,3,4,5,6,7] = [X,Y,Z,W,L,H,SIN,COS]
-        # We add the full anchor and subtract what we don't want to refine
-        # Simpler: slice refine_state from both, add, then reconstruct
+        # Residual refinement
         if self.refine_yaw:
-            # refine_state = [0:8], non-refine = [8:11]
             refined_pos = ttnn.slice(refined, [0, 0, 0], [bs, num_anchor, 8])
             anchor_pos = ttnn.slice(anchor, [0, 0, 0], [bs, num_anchor, 8])
+            old_refined_pos = refined_pos
             refined_pos = ttnn.add(refined_pos, anchor_pos)
+            ttnn.deallocate(old_refined_pos)
+            ttnn.deallocate(anchor_pos)
 
             refined_vel = ttnn.slice(
                 refined, [0, 0, VX], [bs, num_anchor, self.output_dim]
             )
         else:
-            # refine_state = [0:6], non-refine = [6:11]
             refined_pos = ttnn.slice(refined, [0, 0, 0], [bs, num_anchor, 6])
             anchor_pos = ttnn.slice(anchor, [0, 0, 0], [bs, num_anchor, 6])
+            old_refined_pos = refined_pos
             refined_pos = ttnn.add(refined_pos, anchor_pos)
+            ttnn.deallocate(old_refined_pos)
+            ttnn.deallocate(anchor_pos)
 
             refined_yaw = ttnn.slice(refined, [0, 0, SIN_YAW], [bs, num_anchor, VX])
             refined_vel = ttnn.slice(
                 refined, [0, 0, VX], [bs, num_anchor, self.output_dim]
             )
+        ttnn.deallocate(refined)
 
         # Velocity refinement: vel = output[VX:] / time_interval + anchor[VX:]
         if self.output_dim > 8:
-            # time_interval: [bs] → [bs, 1, 1] for broadcast
             ti = ttnn.reshape(time_interval, (bs, 1, 1))
             ti_recip = ttnn.reciprocal(ti)
+            old_vel = refined_vel
             refined_vel = ttnn.multiply(refined_vel, ti_recip)
+            ttnn.deallocate(old_vel)
+            ttnn.deallocate(ti_recip)
             anchor_vel = ttnn.slice(
                 anchor, [0, 0, VX], [bs, num_anchor, VX + (self.output_dim - VX)]
             )
+            old_vel = refined_vel
             refined_vel = ttnn.add(refined_vel, anchor_vel)
+            ttnn.deallocate(old_vel)
+            ttnn.deallocate(anchor_vel)
 
         # Reconstruct full output
         if self.refine_yaw:
             output = ttnn.concat([refined_pos, refined_vel], dim=-1)
         else:
             output = ttnn.concat([refined_pos, refined_yaw, refined_vel], dim=-1)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(refined_pos)
+        ttnn.deallocate(refined_vel)
+        if not self.refine_yaw:
+            ttnn.deallocate(refined_yaw)
 
         # --- Classification ---
         cls = None
@@ -202,10 +238,33 @@ class SparseBox3DRefinementModule:
             inst_flat = ttnn.reshape(
                 instance_feature, (1, 1, n, self.embed_dims)
             )
-            cls_feat = self._run_layers(inst_flat, self.cls_layers)
+
+            cls_feat = inst_flat
+            for layer_idx, entry in enumerate(self.cls_layers):
+                linear_in = cls_feat
+                cls_feat = ttnn.linear(cls_feat, entry["weight"], bias=entry["bias"],
+                                       compute_kernel_config=self._hifi_compute_config)
+                relu_in = cls_feat
+                cls_feat = ttnn.relu(cls_feat)
+                if "ln_weight" in entry:
+                    relu_out = cls_feat
+                    cls_feat = ttnn.layer_norm(
+                        cls_feat, weight=entry["ln_weight"], bias=entry["ln_bias"],
+                        compute_kernel_config=self._hifi_compute_config,
+                    )
+                    ttnn.synchronize_device(self.device)
+                    ttnn.deallocate(relu_in)
+                    ttnn.deallocate(relu_out)
+                if layer_idx > 0:
+                    ttnn.deallocate(linear_in)
+
             cls = ttnn.linear(
-                cls_feat, self.cls_final_weight, bias=self.cls_final_bias
+                cls_feat, self.cls_final_weight, bias=self.cls_final_bias,
+                compute_kernel_config=self._hifi_compute_config,
             )
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(cls_feat)
+
             cls = ttnn.reshape(cls, (bs, num_anchor, self.num_cls))
 
         # --- Quality estimation ---
@@ -213,12 +272,14 @@ class SparseBox3DRefinementModule:
         if return_cls and self.with_quality_estimation:
             qt_feat = self._run_layers(feature_flat, self.quality_layers)
             quality = ttnn.linear(
-                qt_feat, self.quality_final_weight, bias=self.quality_final_bias
+                qt_feat, self.quality_final_weight, bias=self.quality_final_bias,
+                compute_kernel_config=self._hifi_compute_config,
             )
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(qt_feat)
             quality = ttnn.reshape(quality, (bs, num_anchor, 2))
 
         return output, cls, quality
-
 
 def _extract_linear_relu_ln_params(modules_list):
     """Extract params from list of modules: Linear→ReLU→LN chains."""
