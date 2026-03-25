@@ -25,6 +25,7 @@
 
 import torch
 import ttnn
+from loguru import logger
 
 
 class MultiheadAttention:
@@ -48,6 +49,10 @@ class MultiheadAttention:
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.head_dim = embed_dims // num_heads
+        self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
+            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+        )
 
         # Q, K, V projection weights (already transposed: [in, out] for ttnn.linear)
         self.w_q = self._to_device(parameters["w_q"])
@@ -66,20 +71,23 @@ class MultiheadAttention:
             torch.full((1, 1, 1, 1), self.head_dim**-0.5),
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
+            dtype=ttnn.float32,
         )
 
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device,
+            dtype=ttnn.float32,
         )
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device,
+            dtype=ttnn.float32,
         )
 
     def run(
@@ -110,54 +118,92 @@ class MultiheadAttention:
         # Save identity for residual
         identity = query
 
+        # Handle key=None, value=None (self-attention: use query for all)
+        if key is None:
+            key = query
+            num_keys = num_queries
+        if value is None:
+            value = query
+
         # --- 1. Linear projections ---
-        q = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
-        q = ttnn.linear(q, self.w_q, bias=self.b_q)
+        logger.debug("MHA: Q reshape start")
+        q_flat = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
+        logger.debug(f"MHA: Q linear start, q={q_flat.shape}")
+        q = ttnn.linear(q_flat, self.w_q, bias=self.b_q, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        logger.debug("MHA: Q linear done")
 
-        k = ttnn.reshape(key, (1, 1, bs * num_keys, self.embed_dims))
-        k = ttnn.linear(k, self.w_k, bias=self.b_k)
+        logger.debug("MHA: K reshape start")
+        k_flat = ttnn.reshape(key, (1, 1, bs * num_keys, self.embed_dims))
+        logger.debug(f"MHA: K linear start, k={k_flat.shape}")
+        k = ttnn.linear(k_flat, self.w_k, bias=self.b_k, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        logger.debug("MHA: K linear done")
 
-        v = ttnn.reshape(value, (1, 1, bs * num_keys, self.embed_dims))
-        v = ttnn.linear(v, self.w_v, bias=self.b_v)
+        logger.debug("MHA: V reshape start")
+        v_flat = ttnn.reshape(value, (1, 1, bs * num_keys, self.embed_dims))
+        logger.debug(f"MHA: V linear start, v={v_flat.shape}")
+        v = ttnn.linear(v_flat, self.w_v, bias=self.b_v, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        logger.debug("MHA: V linear done")
 
         # --- 2. Multi-head reshape ---
-        # [1, 1, bs*seq, embed] -> [bs, seq, num_heads, head_dim] -> [bs, num_heads, seq, head_dim]
+        logger.debug("MHA: multi-head reshape start")
         q = ttnn.reshape(q, (bs, num_queries, self.num_heads, self.head_dim))
-        q = ttnn.permute(q, (0, 2, 1, 3))  # [bs, num_heads, num_queries, head_dim]
+        q = ttnn.permute(q, (0, 2, 1, 3))
 
         k = ttnn.reshape(k, (bs, num_keys, self.num_heads, self.head_dim))
-        k = ttnn.permute(k, (0, 2, 1, 3))  # [bs, num_heads, num_keys, head_dim]
+        k = ttnn.permute(k, (0, 2, 1, 3))
 
         v = ttnn.reshape(v, (bs, num_keys, self.num_heads, self.head_dim))
-        v = ttnn.permute(v, (0, 2, 1, 3))  # [bs, num_heads, num_keys, head_dim]
+        v = ttnn.permute(v, (0, 2, 1, 3))
+        ttnn.synchronize_device(self.device)
+        logger.debug("MHA: multi-head reshape done")
 
         # --- 3. Scaled dot-product attention ---
-        # Q @ K^T -> [bs, num_heads, num_queries, num_keys]
-        k_t = ttnn.transpose(k, -2, -1)  # [bs, num_heads, head_dim, num_keys]
-        attn_weights = ttnn.matmul(q, k_t)
+        logger.debug(f"MHA: matmul q@k_t start, q={q.shape}, k={k.shape}")
+        k_t = ttnn.transpose(k, -2, -1)
+        attn_weights = ttnn.matmul(q, k_t, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(q)
+        ttnn.deallocate(k)
+        ttnn.deallocate(k_t)
+        logger.debug("MHA: matmul q@k_t done")
+
         attn_weights = ttnn.multiply(attn_weights, self.scale)
+        attn_weights = ttnn.softmax(attn_weights, dim=-1, numeric_stable=True,
+                                    compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
 
-        # Softmax over keys dimension
-        attn_weights = ttnn.softmax(attn_weights, dim=-1)
+        logger.debug("MHA: softmax done")
 
-        # Attention output: [bs, num_heads, num_queries, head_dim]
-        attn_output = ttnn.matmul(attn_weights, v)
+        attn_output = ttnn.matmul(attn_weights, v, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(attn_weights)
+        ttnn.deallocate(v)
+
+        logger.debug("MHA: matmul attn@v done")
 
         # --- 4. Reshape back ---
-        # [bs, num_heads, num_queries, head_dim] -> [bs, num_queries, num_heads, head_dim]
         attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
         attn_output = ttnn.reshape(
             attn_output, (1, 1, bs * num_queries, self.embed_dims)
         )
 
         # --- 5. Output projection ---
-        output = ttnn.linear(attn_output, self.w_out, bias=self.b_out)
+        logger.debug("MHA: output projection start")
+        output = ttnn.linear(attn_output, self.w_out, bias=self.b_out, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(attn_output)
+
+        logger.debug("MHA: output projection done")
 
         # --- 6. Residual connection ---
         identity_flat = ttnn.reshape(
             identity, (1, 1, bs * num_queries, self.embed_dims)
         )
         output = ttnn.add(output, identity_flat)
+
         output = ttnn.reshape(output, (bs, num_queries, self.embed_dims))
 
         return output
