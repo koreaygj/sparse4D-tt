@@ -131,12 +131,10 @@ class _PTAsymmetricFFN(nn.Module):
 
     def forward(self, x, identity=None):
         if self.pre_norm is not None:
-            x_normed = self.pre_norm(x)
-        else:
-            x_normed = x
-        out = self.layers(x_normed)
+            x = self.pre_norm(x)  # mmcv overwrites x in-place
+        out = self.layers(x)
         if identity is None:
-            identity = x
+            identity = x  # identity = pre_norm(x), matching mmcv
         identity = self.identity_fc(identity)
         return identity + out
 
