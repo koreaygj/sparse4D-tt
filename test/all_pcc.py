@@ -156,7 +156,8 @@ def test_ffn(device):
 
     x = torch.randn(bs, N, in_ch)
     with torch.no_grad():
-        pt_out = identity_fc(x) + layers(pre_norm(x))
+        x_normed = pre_norm(x)  # mmcv overwrites x in forward
+        pt_out = identity_fc(x_normed) + layers(x_normed)
 
     params = {
         "pre_norm_weight": pre_norm.weight.data.clone(),
@@ -183,7 +184,8 @@ def test_ffn(device):
     )
     x2 = torch.randn(bs, N, in_ch2)
     with torch.no_grad():
-        pt_out2 = x2 + layers2(pre_norm2(x2))
+        x2_normed = pre_norm2(x2)
+        pt_out2 = x2_normed + layers2(x2_normed)
 
     params2 = {
         "pre_norm_weight": pre_norm2.weight.data.clone(),

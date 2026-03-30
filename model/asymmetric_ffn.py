@@ -40,6 +40,10 @@ class AsymmetricFFN:
         self.in_channels = in_channels
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
+        self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
+            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+        )
 
         # pre_norm: LayerNorm(in_channels)
         self.pre_norm_weight = self._to_device_1d(parameters["pre_norm_weight"])
@@ -65,21 +69,21 @@ class AsymmetricFFN:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def run(
@@ -103,30 +107,48 @@ class AsymmetricFFN:
 
         # --- 1. Pre-norm (LayerNorm) ---
         normed = ttnn.layer_norm(
-            x_flat, weight=self.pre_norm_weight, bias=self.pre_norm_bias
+            x_flat, weight=self.pre_norm_weight, bias=self.pre_norm_bias,
+            epsilon=1e-5,
+            compute_kernel_config=self._hifi_compute_config,
         )
 
-        # --- 2. Linear(in_channels → feedforward_channels) + ReLU ---
-        hidden = ttnn.linear(normed, self.fc1_weight, bias=self.fc1_bias)
-        hidden = ttnn.relu(hidden)
-
-        # --- 3. Linear(feedforward_channels → embed_dims) ---
-        projected = ttnn.linear(hidden, self.fc2_weight, bias=self.fc2_bias)
-
-        # --- 4. Identity path ---
+        # --- 2. Identity path (use normed input, matching mmcv AsymmetricFFN) ---
+        # mmcv default: identity=None → identity = pre_norm(x), then identity_fc(identity)
         if self.has_identity_fc:
             identity = ttnn.linear(
-                x_flat, self.identity_fc_weight, bias=self.identity_fc_bias
+                normed, self.identity_fc_weight, bias=self.identity_fc_bias,
+                compute_kernel_config=self._hifi_compute_config,
             )
         else:
-            identity = x_flat
+            identity = normed
+
+        # --- 3. Linear(in_channels → feedforward_channels) + ReLU ---
+        fc1_out = ttnn.linear(normed, self.fc1_weight, bias=self.fc1_bias, compute_kernel_config=self._hifi_compute_config)
+        # Only deallocate normed if identity doesn't alias it (asymmetric case)
+        if self.has_identity_fc:
+            ttnn.deallocate(normed)
+
+        relu_out = ttnn.relu(fc1_out)
+
+        # --- 4. Linear(feedforward_channels → embed_dims) ---
+        projected = ttnn.linear(relu_out, self.fc2_weight, bias=self.fc2_bias, compute_kernel_config=self._hifi_compute_config)
+
+        # Sync + deallocate large intermediates (1024-dim tensors)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(fc1_out)
+        ttnn.deallocate(relu_out)
 
         # --- 5. Residual ---
         output = ttnn.add(identity, projected)
+
+        # Sync + deallocate
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(projected)
+        ttnn.deallocate(identity)
+
         output = ttnn.reshape(output, (bs, num_tokens, self.embed_dims))
 
         return output
-
 
 def preprocess_ffn_parameters(pt_ffn_layer) -> dict:
     """Extract parameters from mmcv AsymmetricFFN.

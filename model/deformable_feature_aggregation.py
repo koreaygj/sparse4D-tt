@@ -3,22 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # =============================================================================
-# DeformableFeatureAggregation for TT Devices (Device-Only)
-#
-# All operations run on TT device using ttnn ops. No host-device transfers
-# during forward pass except final output retrieval.
+# DeformableFeatureAggregation for TT Devices
 #
 # Forward flow:
-#   1. kps_generator: anchor → 3D key points (ttnn ops)
-#   2. project_points: 3D → 2D via projection matrix (ttnn.matmul)
-#   3. get_weights: instance_feature → attention weights (ttnn.linear + softmax)
-#   4. feature_sampling: grid_sample per FPN level (ttnn.grid_sample)
-#   5. multi_view_level_fusion: weighted sum (ttnn.multiply + ttnn.sum)
-#   6. output_proj: ttnn.linear + residual
+#   1. kps_generator: anchor → 3D key points
+#      - fixed/learnable key points: device (ttnn ops)
+#      - rotation + translation: HOST (ttnn.slice hang workaround, small tensor ~35K elements)
+#   2. project_points: 3D → 2D via projection matrix (ttnn.matmul, device)
+#   3. get_weights: instance_feature → attention weights (ttnn.linear + softmax, device)
+#   4. feature_sampling: grid_sample per FPN level (ttnn.grid_sample_lerp, device)
+#      - lerp-based bilinear: 2-pass lerp reduces BF16 rounding from 2x to 1x
+#   5. multi_view_level_fusion: weighted sum (ttnn.multiply + ttnn.sum, device)
+#   6. output_proj: ttnn.linear + residual (device)
 # =============================================================================
 
 from typing import Dict, List, Tuple
-import time
 
 import torch
 import ttnn
@@ -32,6 +31,7 @@ VX, VY, VZ = 8, 9, 10
 
 
 class DeformableFeatureAggregation:
+
     def __init__(
         self,
         device,
@@ -57,6 +57,29 @@ class DeformableFeatureAggregation:
         self.use_camera_embed = use_camera_embed
         self.residual_mode = residual_mode
         self.model_config = model_config
+
+        # HiFi compute config for precision-sensitive operations
+        self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+            math_approx_mode=False,
+        )
+
+        # Pre-allocate scalar constants on device (reused per camera in _project_points)
+        self._scalar_two = ttnn.from_torch(
+            torch.full((1, 1, 1), 2.0),
+            layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.float32,
+        )
+        self._scalar_one = ttnn.from_torch(
+            torch.full((1, 1, 1), 1.0),
+            layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.float32,
+        )
+        self._scalar_half = ttnn.from_torch(
+            torch.full((1, 1, 1), 0.5),
+            layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.float32,
+        )
 
         # --- Move all parameters to TT device ---
         # Note: PyTorch nn.Linear stores weight as [out, in],
@@ -109,21 +132,21 @@ class DeformableFeatureAggregation:
         if tensor.dim() == 2:
             # Pad to tile-aligned if needed
             pass
-        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device)
+        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
         return t
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move bias tensor to device as [1, 1, 1, N] in TILE layout."""
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device)
+        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
         return t
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move 1D tensor (LayerNorm weight/bias) to device as [1, 1, 1, N]."""
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device)
+        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
         return t
 
     def _kps_generator(
@@ -144,80 +167,83 @@ class DeformableFeatureAggregation:
         """
         # Extract size [W, L, H] and compute exp
         # anchor [..., 3:6] -> size
+        logger.debug(f"_kps_generator: slice+exp, anchor shape={anchor.shape}")
         size_wlh = ttnn.slice(
             anchor, [0, 0, W], [bs, num_anchor, H + 1]
         )  # [bs, num_anchor, 3]
         size = ttnn.exp(size_wlh)  # [bs, num_anchor, 3]
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(size_wlh)
+        logger.debug("_kps_generator: slice+exp done")
 
         # Reshape size for broadcasting: [bs*num_anchor, 1, 3]
         size_3d = ttnn.reshape(size, (bs * num_anchor, 1, 3))
 
         # Fixed key points: fix_scale [7, 3] * size [bs*num_anchor, 1, 3]
-        # Broadcast multiply
-        fix_scale_dev = self.fix_scale  # [7, 3] on device
-        # Expand fix_scale to [1, 7, 3] for broadcast with [bs*num_anchor, 1, 3]
-        fix_scale_3d = ttnn.reshape(fix_scale_dev, (1, 7, 3))
-
-        # size_for_fix: [bs*num_anchor, 1, 3] broadcast with [1, 7, 3]
+        fix_scale_3d = ttnn.reshape(self.fix_scale, (1, 7, 3))
         fix_kps = ttnn.multiply(fix_scale_3d, size_3d)  # [bs*num_anchor, 7, 3]
+        ttnn.synchronize_device(self.device)
+        logger.debug("_kps_generator: fix_kps done")
 
-        # Learnable key points: linear(instance_feature) -> sigmoid - 0.5
-        # instance_feature: [bs, num_anchor, 256] -> flatten to [bs*num_anchor, 1, 256]
+        # Learnable key points
         inst_flat = ttnn.reshape(
             instance_feature, (1, 1, bs * num_anchor, self.embed_dims)
         )
         learnable = ttnn.linear(
-            inst_flat, self.learnable_fc_weight, bias=self.learnable_fc_bias
+            inst_flat, self.learnable_fc_weight, bias=self.learnable_fc_bias,
+            compute_kernel_config=self._hifi_compute_config,
         )  # [1, 1, bs*num_anchor, 18]
+        ttnn.synchronize_device(self.device)
+        logger.debug("_kps_generator: learnable linear done")
+
         learnable = ttnn.reshape(
             learnable, (bs * num_anchor, self.num_learnable_pts, 3)
         )  # [bs*num_anchor, 6, 3]
         learnable = ttnn.sigmoid(learnable)
-        half = ttnn.from_torch(
-            torch.full((1, 1, 1), 0.5),
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-        )
-        learnable = ttnn.subtract(learnable, half)  # sigmoid - 0.5
-
-        # learnable * size: [bs*num_anchor, 6, 3] * [bs*num_anchor, 1, 3]
+        learnable = ttnn.subtract(learnable, self._scalar_half)  # sigmoid - 0.5
         learnable_kps = ttnn.multiply(learnable, size_3d)  # [bs*num_anchor, 6, 3]
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(learnable)
+        # Note: size_3d is a reshape (view) of size, don't deallocate separately
+        logger.debug("_kps_generator: learnable_kps done")
 
         # Concat fixed + learnable: [bs*num_anchor, 13, 3]
         key_points = ttnn.concat([fix_kps, learnable_kps], dim=1)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(fix_kps)
+        ttnn.deallocate(learnable_kps)
+        logger.debug("_kps_generator: concat done")
 
-        # Rotate by yaw angle (element-wise, no rotation matrix needed)
-        # cos_yaw, sin_yaw from anchor[:, :, 6:8]
-        cos_yaw = ttnn.slice(anchor, [0, 0, COS_YAW], [bs, num_anchor, COS_YAW + 1])
-        sin_yaw = ttnn.slice(anchor, [0, 0, SIN_YAW], [bs, num_anchor, SIN_YAW + 1])
-        # [bs, num_anchor, 1] -> [bs*num_anchor, 1, 1] for broadcast
-        cos_yaw = ttnn.reshape(cos_yaw, (bs * num_anchor, 1, 1))
-        sin_yaw = ttnn.reshape(sin_yaw, (bs * num_anchor, 1, 1))
+        # --- Host fallback for rotation + translation (small tensors, avoids TILE hang) ---
+        key_points_torch = ttnn.to_torch(key_points)  # [bs*num_anchor, 13, 3]
+        ttnn.deallocate(key_points)
+        anchor_torch = ttnn.to_torch(anchor)  # [bs, num_anchor, 11]
 
-        # kp_x = key_points[..., 0:1], kp_y = key_points[..., 1:2], kp_z = key_points[..., 2:3]
-        kp_x = ttnn.slice(key_points, [0, 0, 0], [bs * num_anchor, self.num_pts, 1])
-        kp_y = ttnn.slice(key_points, [0, 0, 1], [bs * num_anchor, self.num_pts, 2])
-        kp_z = ttnn.slice(key_points, [0, 0, 2], [bs * num_anchor, self.num_pts, 3])
+        cos_yaw = anchor_torch[:, :, COS_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
+        sin_yaw = anchor_torch[:, :, SIN_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
 
-        # rot_x = cos*kp_x - sin*kp_y
-        # rot_y = sin*kp_x + cos*kp_y
-        rot_x = ttnn.subtract(
-            ttnn.multiply(cos_yaw, kp_x), ttnn.multiply(sin_yaw, kp_y)
+        kp_x = key_points_torch[:, :, 0]  # [900, 13]
+        kp_y = key_points_torch[:, :, 1]  # [900, 13]
+        kp_z = key_points_torch[:, :, 2]  # [900, 13]
+
+        rot_x = cos_yaw * kp_x - sin_yaw * kp_y
+        rot_y = sin_yaw * kp_x + cos_yaw * kp_y
+
+        key_points_torch = torch.stack([rot_x, rot_y, kp_z], dim=-1)  # [900, 13, 3]
+
+        # Translate to anchor center
+        center = anchor_torch[:, :, X:Z + 1].reshape(bs * num_anchor, 1, 3)  # [900, 1, 3]
+        key_points_torch = key_points_torch + center
+
+        # Reshape to [bs, num_anchor*num_pts, 3] and send back to device
+        key_points_torch = key_points_torch.reshape(bs, num_anchor * self.num_pts, 3)
+        key_points = ttnn.from_torch(
+            key_points_torch.float(),
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            dtype=ttnn.float32,
         )
-        rot_y = ttnn.add(ttnn.multiply(sin_yaw, kp_x), ttnn.multiply(cos_yaw, kp_y))
-        # rot_z = kp_z (unchanged)
-
-        # Concat rotated: [bs*num_anchor, num_pts, 3]
-        key_points = ttnn.concat([rot_x, rot_y, kp_z], dim=-1)
-
-        # Translate to anchor center: anchor[..., 0:3] = [X, Y, Z]
-        center = ttnn.slice(anchor, [0, 0, X], [bs, num_anchor, Z + 1])
-        center = ttnn.reshape(center, (bs * num_anchor, 1, 3))
-        key_points = ttnn.add(key_points, center)
-
-        # Reshape to [bs, num_anchor, num_pts, 3]
-        # For matmul in projection we keep [bs, num_anchor*num_pts, 3]
-        key_points = ttnn.reshape(key_points, (bs, num_anchor * self.num_pts, 3))
+        logger.debug("_kps_generator: rotation+translate (host) done")
 
         return key_points
 
@@ -237,7 +263,7 @@ class DeformableFeatureAggregation:
             image_wh: [bs, num_cams, 2] on device
 
         Returns:
-            points_2d_grid: [bs*num_cams, num_anchor, num_pts, 2] on device (ROW_MAJOR, float32)
+            points_2d_grid: [bs*num_cams, num_anchor, num_pts, 2] on device
         """
         n_pts_total = num_anchor * self.num_pts
 
@@ -246,63 +272,87 @@ class DeformableFeatureAggregation:
             torch.ones(bs, n_pts_total, 1),
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
+            dtype=ttnn.float32,
         )
         pts_homo = ttnn.concat([key_points, ones], dim=-1)  # [bs, n_pts_total, 4]
 
         # Per-camera projection via loop (avoid 6D tensor)
         all_cam_points = []
         for cam_idx in range(self.num_cams):
-            # proj: [bs, 4, 4] for this camera
+            logger.debug(f"DFA _project_points: cam {cam_idx}/{self.num_cams} start")
             proj = ttnn.slice(
                 projection_mat,
                 [0, cam_idx, 0, 0],
                 [bs, cam_idx + 1, 4, 4],
-            )  # [bs, 1, 4, 4]
+            )
             proj = ttnn.reshape(proj, (bs, 4, 4))
 
-            # pts_homo: [bs, n_pts_total, 4]
-            # result = pts_homo @ proj^T -> [bs, n_pts_total, 4]
-            proj_t = ttnn.transpose(proj, -2, -1)  # [bs, 4, 4]
-            projected = ttnn.matmul(pts_homo, proj_t)  # [bs, n_pts_total, 4]
+            proj_t = ttnn.transpose(proj, -2, -1)
+            projected = ttnn.matmul(pts_homo, proj_t, compute_kernel_config=self._hifi_compute_config)
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(proj)
+            ttnn.deallocate(proj_t)
+            logger.debug(f"DFA _project_points: cam {cam_idx} matmul done")
 
-            # Perspective divide: xy / max(z, 1e-5)
             xy = ttnn.slice(projected, [0, 0, 0], [bs, n_pts_total, 2])
             z = ttnn.slice(projected, [0, 0, 2], [bs, n_pts_total, 3])
             z_clamped = ttnn.clamp(z, min=1e-5)
-            xy_div = ttnn.multiply(
-                xy, ttnn.reciprocal(z_clamped)
-            )  # [bs, n_pts_total, 2]
+            z_recip = ttnn.reciprocal(z_clamped)
+            xy_div = ttnn.multiply(xy, z_recip)
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(projected)
+            ttnn.deallocate(xy)
+            ttnn.deallocate(z)
+            ttnn.deallocate(z_clamped)
+            ttnn.deallocate(z_recip)
+            logger.debug(f"DFA _project_points: cam {cam_idx} perspective divide done")
 
-            # Normalize by image_wh: [bs, 1, 2] for this cam
             wh = ttnn.slice(image_wh, [0, cam_idx, 0], [bs, cam_idx + 1, 2])
             wh = ttnn.reshape(wh, (bs, 1, 2))
-            xy_norm = ttnn.multiply(
-                xy_div, ttnn.reciprocal(wh)
-            )  # [bs, n_pts_total, 2] in [0,1]
+            wh_recip = ttnn.reciprocal(wh)
+            ttnn.deallocate(wh)
+            xy_norm = ttnn.multiply(xy_div, wh_recip)
 
-            # Convert to grid_sample range [-1, 1]
-            two = ttnn.from_torch(
-                torch.full((1, 1, 1), 2.0),
-                layout=ttnn.TILE_LAYOUT,
-                device=self.device,
-            )
-            one = ttnn.from_torch(
-                torch.full((1, 1, 1), 1.0),
-                layout=ttnn.TILE_LAYOUT,
-                device=self.device,
-            )
-            xy_grid = ttnn.subtract(ttnn.multiply(xy_norm, two), one)
-            # [bs, n_pts_total, 2]
+            xy_scaled = ttnn.multiply(xy_norm, self._scalar_two)
+            xy_grid = ttnn.subtract(xy_scaled, self._scalar_one)
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(xy_div)
+            ttnn.deallocate(wh_recip)
+            ttnn.deallocate(xy_norm)
+            ttnn.deallocate(xy_scaled)
+            logger.debug(f"DFA _project_points: cam {cam_idx} grid done")
 
-            # Reshape to [bs, num_anchor, num_pts, 2]
             xy_grid = ttnn.reshape(xy_grid, (bs, num_anchor, self.num_pts, 2))
             all_cam_points.append(xy_grid)
 
-        # Stack cameras: concat along dim0 after reshape
-        # Each is [bs, num_anchor, num_pts, 2]
-        # We want [bs*num_cams, num_anchor, num_pts, 2]
-        points_2d = ttnn.concat(all_cam_points, dim=0)
-        # [bs*num_cams, num_anchor, num_pts, 2]
+        # Interleave camera results to match PyTorch order:
+        # PyTorch: [b0_c0, b0_c1, ..., b0_c5, b1_c0, ...] (batch varies slowest)
+        # Each cam result: [bs, num_anchor, num_pts, 2]
+        if bs == 1:
+            # Simple case: just concat cameras along dim=0
+            points_2d = ttnn.concat(all_cam_points, dim=0)
+        else:
+            # For bs>1: need to interleave batch and camera dims
+            # Slice per-batch from each camera, then concat in correct order
+            interleaved = []
+            for b in range(bs):
+                for cam_idx in range(self.num_cams):
+                    cam_data = all_cam_points[cam_idx]
+                    b_slice = ttnn.slice(
+                        cam_data,
+                        [b, 0, 0, 0],
+                        [b + 1, num_anchor, self.num_pts, 2],
+                    )
+                    interleaved.append(b_slice)
+            points_2d = ttnn.concat(interleaved, dim=0)
+            for s in interleaved:
+                ttnn.deallocate(s)
+
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(pts_homo)
+        ttnn.deallocate(ones)
+        for p in all_cam_points:
+            ttnn.deallocate(p)
 
         return points_2d
 
@@ -324,14 +374,26 @@ class DeformableFeatureAggregation:
         cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
 
         # Linear1: [bs*num_cams, 12] -> [bs*num_cams, 256]
-        x = ttnn.linear(cam_input, self.cam_linear1_weight, bias=self.cam_linear1_bias)
+        x = ttnn.linear(cam_input, self.cam_linear1_weight, bias=self.cam_linear1_bias, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(cam_input)
+        relu_in = x
         x = ttnn.relu(x)
-        x = ttnn.layer_norm(x, weight=self.cam_ln1_weight, bias=self.cam_ln1_bias)
+        relu_out = x
+        x = ttnn.layer_norm(x, weight=self.cam_ln1_weight, bias=self.cam_ln1_bias, epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(relu_in)
+        ttnn.deallocate(relu_out)
 
         # Linear2: [bs*num_cams, 256] -> [bs*num_cams, 256]
-        x = ttnn.linear(x, self.cam_linear2_weight, bias=self.cam_linear2_bias)
+        linear2_in = x
+        x = ttnn.linear(x, self.cam_linear2_weight, bias=self.cam_linear2_bias, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(linear2_in)
+        relu_in = x
         x = ttnn.relu(x)
-        x = ttnn.layer_norm(x, weight=self.cam_ln2_weight, bias=self.cam_ln2_bias)
+        relu_out = x
+        x = ttnn.layer_norm(x, weight=self.cam_ln2_weight, bias=self.cam_ln2_bias, epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(relu_in)
+        ttnn.deallocate(relu_out)
 
         # Reshape to [bs, num_cams, 256]
         x = ttnn.reshape(x, (bs, self.num_cams, self.embed_dims))
@@ -359,47 +421,34 @@ class DeformableFeatureAggregation:
 
         if self.use_camera_embed:
             camera_embed = self._camera_encoder(projection_mat, bs)
-            # [bs, num_cams, 256]
-
-            # feature[:, :, None] + camera_embed[:, None]
-            # -> [bs, num_anchor, num_cams, 256]
-            # Reshape for broadcast add:
             feat_exp = ttnn.reshape(feature, (bs, num_anchor, 1, self.embed_dims))
             cam_exp = ttnn.reshape(
                 camera_embed, (bs, 1, self.num_cams, self.embed_dims)
             )
             feature = ttnn.add(feat_exp, cam_exp)
-            # [bs, num_anchor, num_cams, 256]
-
-            # Flatten for linear: [1, 1, bs*num_anchor*num_cams, 256]
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(camera_embed)
             feature = ttnn.reshape(
                 feature, (1, 1, bs * num_anchor * self.num_cams, self.embed_dims)
             )
         else:
             feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
 
-        # weights_fc: -> [..., 416] where 416 = num_groups * num_levels * num_pts
         weights = ttnn.linear(
-            feature, self.weights_fc_weight, bias=self.weights_fc_bias
+            feature, self.weights_fc_weight, bias=self.weights_fc_bias,
+            compute_kernel_config=self._hifi_compute_config,
         )
+        ttnn.synchronize_device(self.device)
 
-        # Reshape for softmax: [..., num_cams*num_levels*num_pts, num_groups]
+        ttnn.deallocate(feature)
+
         total_clp = self.num_cams * self.num_levels * self.num_pts
         if self.use_camera_embed:
-            # [1, 1, bs*num_anchor*num_cams, 416]
-            # 416 = num_levels * num_pts * num_groups = 4 * 13 * 8
-            # Reshape to [bs*num_anchor, num_cams*num_levels*num_pts, num_groups]
             weights = ttnn.reshape(
                 weights,
-                (
-                    1,
-                    1,
-                    bs * num_anchor,
-                    self.num_cams * self.num_levels * self.num_pts * self.num_groups,
-                ),
+                (1, 1, bs * num_anchor,
+                 self.num_cams * self.num_levels * self.num_pts * self.num_groups),
             )
-            # For softmax over cams*levels*pts dim:
-            # [bs*num_anchor, cams*levels*pts, groups]
             weights = ttnn.reshape(
                 weights, (bs * num_anchor, total_clp, self.num_groups)
             )
@@ -408,8 +457,8 @@ class DeformableFeatureAggregation:
                 weights, (bs * num_anchor, total_clp, self.num_groups)
             )
 
-        # Softmax over dim=1 (cams*levels*pts)
-        weights = ttnn.softmax(weights, dim=1)
+        weights = ttnn.softmax(weights, dim=1, numeric_stable=True,
+                               compute_kernel_config=self._hifi_compute_config)
 
         return weights
 
@@ -421,11 +470,7 @@ class DeformableFeatureAggregation:
         bs: int,
         num_anchor: int,
     ) -> ttnn.Tensor:
-        """Sample features from FPN maps on device (fully device-only).
-
-        Uses per-camera slice + concat to rearrange without host transfer.
-        grid_sample results [bs*num_cams, num_anchor, num_pts, embed_dims] are
-        sliced per camera, then interleaved per level via concat.
+        """Sample features from FPN maps.
 
         Weight order from _get_weights: for each cam, for each level, for each pt.
         So we need: cam0_lvl0_pts, cam0_lvl1_pts, ..., cam0_lvl3_pts, cam1_lvl0_pts, ...
@@ -440,28 +485,27 @@ class DeformableFeatureAggregation:
         """
         n_batch = bs * self.num_cams
 
-        # 1. grid_sample per level
+        # 1. grid_sample_lerp per level (lerp-based bilinear, device-only)
         all_level_features = []
         for level_idx, fm_tt in enumerate(feature_maps):
             h, w = spatial_shapes[level_idx]
-            logger.debug(f"==== DFA grid_sample level {level_idx}: spatial={h}x{w}")
+            logger.debug(f"==== DFA grid_sample_lerp level {level_idx}: spatial={h}x{w}")
 
             # Reshape feature map: [1, 1, N*H*W, C] -> [N, H, W, C] (NHWC)
             fm = ttnn.to_memory_config(fm_tt, ttnn.DRAM_MEMORY_CONFIG)
             fm = ttnn.to_layout(fm, ttnn.ROW_MAJOR_LAYOUT)
             fm = ttnn.reshape(fm, (n_batch, h, w, self.embed_dims))
 
-            # Grid: [bs*num_cams, num_anchor, num_pts, 2]
+            # Grid: [bs*num_cams, num_anchor, num_pts, 2] — use float32 for precision
             grid = ttnn.to_layout(points_2d, ttnn.ROW_MAJOR_LAYOUT)
             grid = ttnn.to_memory_config(grid, ttnn.DRAM_MEMORY_CONFIG)
+            if grid.dtype != ttnn.float32:
+                grid = ttnn.typecast(grid, ttnn.float32)
 
-            # grid_sample (NHWC)
-            sampled = ttnn.grid_sample(
-                fm,
-                grid,
-                mode="bilinear",
-                align_corners=False,
+            sampled = ttnn.grid_sample_lerp(
+                fm, grid,
                 padding_mode="zeros",
+                align_corners=False,
             )
             # [bs*num_cams, num_anchor, num_pts, embed_dims]
 
@@ -526,6 +570,8 @@ class DeformableFeatureAggregation:
         #   = [1, num_anchor, cams*levels*pts, embed_dims]
         if bs == 1:
             features = ttnn.concat(chunks, dim=2)
+            for c in chunks:
+                ttnn.deallocate(c)
             # [1, num_anchor, num_cams*num_levels*num_pts, embed_dims]
             features = ttnn.reshape(
                 features,
@@ -561,9 +607,10 @@ class DeformableFeatureAggregation:
                 ),
             )
 
-        # Deallocate grid_sample results
-        for sampled in all_level_features:
-            ttnn.deallocate(sampled)
+        # Note: do NOT deallocate all_level_features here — sliced chunks
+        # may still share underlying memory with the concat result.
+        # for sampled in all_level_features:
+        #     ttnn.deallocate(sampled)
 
         return features
 
@@ -584,27 +631,34 @@ class DeformableFeatureAggregation:
             output: [bs*num_anchor, embed_dims] on device
         """
         total_clp = self.num_cams * self.num_levels * self.num_pts
+        n = bs * num_anchor  # 900
 
-        # Split embed_dims into groups: [bs*num_anchor, clp, num_groups, group_dims]
-        features = ttnn.reshape(
-            features, (bs * num_anchor, total_clp, self.num_groups, self.group_dims)
-        )
+        # Use matmul instead of multiply+sum(dim=1) for efficiency
+        # Original: features[n,clp,G,D] * weights[n,clp,G,1] → sum(dim=1) → [n,G,D]
+        # Matmul:   weights[n*G,1,clp] @ features[n*G,clp,D] → [n*G,1,D]
+        logger.debug(f"fusion: matmul approach, n={n}, clp={total_clp}, groups={self.num_groups}")
 
-        # Expand weights: [bs*num_anchor, clp, num_groups, 1]
-        weights = ttnn.reshape(
-            weights, (bs * num_anchor, total_clp, self.num_groups, 1)
-        )
+        # features: [n, clp, embed_dims] → [n, clp, G, D] → [n, G, clp, D] → [n*G, clp, D]
+        features = ttnn.reshape(features, (n, total_clp, self.num_groups, self.group_dims))
+        features = ttnn.transpose(features, 1, 2)  # [n, G, clp, D]
+        features = ttnn.reshape(features, (n * self.num_groups, total_clp, self.group_dims))
 
-        # Weighted features
-        features = ttnn.multiply(features, weights)
-        # [bs*num_anchor, clp, num_groups, group_dims]
+        # weights: [n, clp, G] → [n, G, clp] → [n*G, 1, clp]
+        weights = ttnn.transpose(weights, -2, -1)  # [n, G, clp]
+        weights = ttnn.reshape(weights, (n * self.num_groups, 1, total_clp))
+        logger.debug("fusion: reshape done")
 
-        # Sum over clp dimension (dim=1)
-        features = ttnn.sum(features, dim=1)
-        # [bs*num_anchor, 1, num_groups, group_dims]
+        # matmul: [n*G, 1, clp] @ [n*G, clp, D] = [n*G, 1, D]
+        summed = ttnn.matmul(weights, features, compute_kernel_config=self._hifi_compute_config)
+        ttnn.synchronize_device(self.device)
+        logger.debug("fusion: matmul done")
+        ttnn.deallocate(features)
+        ttnn.deallocate(weights)
 
-        # Reshape: [bs*num_anchor, num_groups*group_dims] = [bs*num_anchor, embed_dims]
-        features = ttnn.reshape(features, (1, 1, bs * num_anchor, self.embed_dims))
+        # Reshape: [n*G, 1, D] → [n, G, D] → [1, 1, n, embed_dims]
+        features = ttnn.reshape(summed, (n, self.num_groups, self.group_dims))
+        features = ttnn.reshape(features, (1, 1, n, self.embed_dims))
+        logger.debug("fusion: final reshape done")
 
         return features
 
@@ -638,38 +692,49 @@ class DeformableFeatureAggregation:
                     [bs, num_anchor, 2*embed_dims] (cat) on device
         """
         # 1. Generate 3D key points
+        logger.debug("DFA run: _kps_generator start")
         key_points = self._kps_generator(anchor, instance_feature, bs, num_anchor)
+        ttnn.synchronize_device(self.device)
+        logger.debug("DFA run: _kps_generator done")
         # [bs, num_anchor*num_pts, 3]
 
         # 2. Project to 2D per camera
+        logger.debug("DFA run: _project_points start")
         points_2d = self._project_points(
             key_points, projection_mat, image_wh, bs, num_anchor
         )
+        ttnn.deallocate(key_points)
         # [bs*num_cams, num_anchor, num_pts, 2]
 
         # 3. Compute attention weights
+        logger.debug("DFA run: _get_weights start")
         weights = self._get_weights(
             instance_feature, anchor_embed, projection_mat, bs, num_anchor
         )
+        logger.debug("DFA run: _get_weights done")
         # [bs*num_anchor, num_cams*num_levels*num_pts, num_groups]
 
-        # 4. Feature sampling (grid_sample on device)
+        # 4+5. Feature sampling (grid_sample_lerp) + fusion
+        logger.debug("DFA run: _feature_sampling start")
         features = self._feature_sampling(
             feature_maps, points_2d, spatial_shapes, bs, num_anchor
         )
-        # [bs*num_anchor, num_cams*num_levels*num_pts, embed_dims]
-
-        # 5. Multi-view level fusion
+        logger.debug("DFA run: _feature_sampling done")
+        logger.debug("DFA run: _multi_view_level_fusion start")
         features = self._multi_view_level_fusion(features, weights, bs, num_anchor)
-        # [1, 1, bs*num_anchor, embed_dims]
+        logger.debug("DFA run: _multi_view_level_fusion done")
+        ttnn.deallocate(points_2d)
 
-        # 6. Output projection
+        logger.debug("DFA run: output_proj start")
         output = ttnn.linear(
-            features, self.output_proj_weight, bias=self.output_proj_bias
+            features, self.output_proj_weight, bias=self.output_proj_bias,
+            compute_kernel_config=self._hifi_compute_config,
         )
-        # [1, 1, bs*num_anchor, embed_dims]
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(features)
+        logger.debug("DFA run: output_proj done")
 
-        # 7. Residual
+        logger.debug("DFA run: residual start")
         inst_flat = ttnn.reshape(
             instance_feature, (1, 1, bs * num_anchor, self.embed_dims)
         )
@@ -679,6 +744,7 @@ class DeformableFeatureAggregation:
         elif self.residual_mode == "cat":
             output = ttnn.concat([output, inst_flat], dim=-1)
             output = ttnn.reshape(output, (bs, num_anchor, 2 * self.embed_dims))
+        logger.debug("DFA run: residual done")
 
         return output
 

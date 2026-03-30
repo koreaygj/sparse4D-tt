@@ -21,6 +21,7 @@
 
 import torch
 import ttnn
+from loguru import logger
 
 # Anchor box field indices
 X, Y, Z = 0, 1, 2
@@ -45,10 +46,16 @@ class SparseBox3DEncoder:
         has_output_fc: bool = False,
         in_loops: int = 1,
         out_loops: int = 4,
+        use_host_compute: bool = True,
     ) -> None:
         self.device = device
         self.vel_dims = vel_dims
         self.mode = mode
+        self._use_host_compute = use_host_compute
+        self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
+            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+        )
         self.has_output_fc = has_output_fc
 
         if not isinstance(embed_dims, (list, tuple)):
@@ -62,6 +69,16 @@ class SparseBox3DEncoder:
         else:
             self.output_dims = embed_dims[0]
 
+        # Store host-side parameters for host compute path
+        if use_host_compute:
+            self.pos_layers_host = self._store_host_params(parameters["pos_fc"])
+            self.size_layers_host = self._store_host_params(parameters["size_fc"])
+            self.yaw_layers_host = self._store_host_params(parameters["yaw_fc"])
+            if vel_dims > 0:
+                self.vel_layers_host = self._store_host_params(parameters["vel_fc"])
+            if has_output_fc:
+                self.out_layers_host = self._store_host_params(parameters["output_fc"])
+
         # Each embedding_layer has (in_loops * out_loops) Linear+LN pairs
         # Structure: for each out_loop: for each in_loop: Linear→ReLU, then LN
         self.pos_layers = self._load_layers(parameters["pos_fc"], out_loops, in_loops)
@@ -71,6 +88,30 @@ class SparseBox3DEncoder:
             self.vel_layers = self._load_layers(parameters["vel_fc"], out_loops, in_loops)
         if has_output_fc:
             self.out_layers = self._load_layers(parameters["output_fc"], out_loops, in_loops)
+
+    def _store_host_params(self, layer_params: list) -> list:
+        """Store parameters as PyTorch tensors for host computation."""
+        stored = []
+        for p in layer_params:
+            entry = {}
+            # weight is already transposed [in, out] for ttnn; transpose back for torch
+            entry["weight"] = p["weight"].t().float().clone()  # [out, in] for F.linear
+            entry["bias"] = p["bias"].float().clone()
+            if "ln_weight" in p:
+                entry["ln_weight"] = p["ln_weight"].float().clone()
+                entry["ln_bias"] = p["ln_bias"].float().clone()
+            stored.append(entry)
+        return stored
+
+    def _run_layers_host(self, x: torch.Tensor, layers: list) -> torch.Tensor:
+        """Run Linear→ReLU→LN chain on host (PyTorch, float32)."""
+        import torch.nn.functional as F
+        for entry in layers:
+            x = F.linear(x, entry["weight"], entry["bias"])
+            x = F.relu(x)
+            if "ln_weight" in entry:
+                x = F.layer_norm(x, [x.shape[-1]], entry["ln_weight"], entry["ln_bias"], eps=1e-5)
+        return x
 
     def _load_layers(self, layer_params: list, out_loops: int, in_loops: int):
         """Load Linear→ReLU→LN chain parameters.
@@ -96,32 +137,48 @@ class SparseBox3DEncoder:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
         return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device
+            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
         )
 
-    def _run_layers(self, x: ttnn.Tensor, layers: list) -> ttnn.Tensor:
+    def _run_layers(self, x: ttnn.Tensor, layers: list, name: str = "") -> ttnn.Tensor:
         """Run Linear→ReLU (→LN) chain."""
-        for entry in layers:
-            x = ttnn.linear(x, entry["weight"], bias=entry["bias"])
+        for idx, entry in enumerate(layers):
+            logger.debug(f"Encoder._run_layers[{name}][{idx}]: linear start, x={x.shape}")
+            linear_in = x
+            x = ttnn.linear(x, entry["weight"], bias=entry["bias"], compute_kernel_config=self._hifi_compute_config)
+            ttnn.synchronize_device(self.device)
+            # Deallocate linear input (skip idx=0: caller owns input)
+            if idx > 0:
+                ttnn.deallocate(linear_in)
+            logger.debug(f"Encoder._run_layers[{name}][{idx}]: linear done")
+            relu_in = x
             x = ttnn.relu(x)
             if "ln_weight" in entry:
+                logger.debug(f"Encoder._run_layers[{name}][{idx}]: layer_norm start")
+                relu_out = x
                 x = ttnn.layer_norm(
-                    x, weight=entry["ln_weight"], bias=entry["ln_bias"]
+                    x, weight=entry["ln_weight"], bias=entry["ln_bias"],
+                    epsilon=1e-5,
+                    compute_kernel_config=self._hifi_compute_config,
                 )
+                ttnn.synchronize_device(self.device)
+                ttnn.deallocate(relu_in)
+                ttnn.deallocate(relu_out)
+                logger.debug(f"Encoder._run_layers[{name}][{idx}]: layer_norm done")
         return x
 
     def run(
@@ -140,40 +197,124 @@ class SparseBox3DEncoder:
         Returns:
             output: [bs, num_anchor, output_dims] on device (TILE)
         """
-        # Extract components via slice
-        pos = ttnn.slice(box_3d, [0, 0, X], [bs, num_anchor, Z + 1])
-        size = ttnn.slice(box_3d, [0, 0, W], [bs, num_anchor, H + 1])
-        yaw = ttnn.slice(box_3d, [0, 0, SIN_YAW], [bs, num_anchor, COS_YAW + 1])
-
-        # Flatten for linear: [1, 1, bs*num_anchor, dim]
+        # Extract components via host slice (avoid ttnn.slice hang on submesh)
+        logger.debug(f"Encoder.run: slice start, box_3d={box_3d.shape}, bs={bs}, num_anchor={num_anchor}")
+        box_pt = ttnn.to_torch(box_3d).float()
         n = bs * num_anchor
-        pos = ttnn.reshape(pos, (1, 1, n, 3))
-        size = ttnn.reshape(size, (1, 1, n, 3))
-        yaw = ttnn.reshape(yaw, (1, 1, n, 2))
 
-        pos_feat = self._run_layers(pos, self.pos_layers)
-        size_feat = self._run_layers(size, self.size_layers)
-        yaw_feat = self._run_layers(yaw, self.yaw_layers)
+        # Host compute path: run Linear→ReLU→LN chains on CPU for higher precision
+        if self._use_host_compute:
+            return self._run_host(box_pt, bs, num_anchor, n)
+
+        pos_pt = box_pt[:, :, X:Z+1].contiguous().reshape(1, 1, n, 3)
+        size_pt = box_pt[:, :, W:H+1].contiguous().reshape(1, 1, n, 3)
+        yaw_pt = box_pt[:, :, SIN_YAW:COS_YAW+1].contiguous().reshape(1, 1, n, 2)
+
+        pos = ttnn.from_torch(pos_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+        size = ttnn.from_torch(size_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+        yaw = ttnn.from_torch(yaw_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+        logger.debug("Encoder.run: slice done")
+
+        logger.debug("Encoder.run: pos_layers start")
+        pos_feat = self._run_layers(pos, self.pos_layers, name="pos")
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(pos)
+        logger.debug("Encoder.run: pos_layers done")
+
+        logger.debug("Encoder.run: size_layers start")
+        size_feat = self._run_layers(size, self.size_layers, name="size")
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(size)
+        logger.debug("Encoder.run: size_layers done")
+
+        logger.debug("Encoder.run: yaw_layers start")
+        yaw_feat = self._run_layers(yaw, self.yaw_layers, name="yaw")
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(yaw)
+        logger.debug("Encoder.run: yaw_layers done")
 
         if self.mode == "add":
             output = ttnn.add(ttnn.add(pos_feat, size_feat), yaw_feat)
         else:
             output = ttnn.concat([pos_feat, size_feat, yaw_feat], dim=-1)
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(pos_feat)
+        ttnn.deallocate(size_feat)
+        ttnn.deallocate(yaw_feat)
+        logger.debug(f"Encoder.run: combine done, mode={self.mode}")
 
         if self.vel_dims > 0:
-            vel = ttnn.slice(box_3d, [0, 0, VX], [bs, num_anchor, VX + self.vel_dims])
-            vel = ttnn.reshape(vel, (1, 1, n, self.vel_dims))
-            vel_feat = self._run_layers(vel, self.vel_layers)
+            vel_pt = box_pt[:, :, VX:VX+self.vel_dims].contiguous().reshape(1, 1, n, self.vel_dims)
+            vel = ttnn.from_torch(vel_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+            logger.debug("Encoder.run: vel_layers start")
+            vel_feat = self._run_layers(vel, self.vel_layers, name="vel")
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(vel)
+            logger.debug("Encoder.run: vel_layers done")
+            logger.debug(f"Encoder.run: vel combine start, mode={self.mode}")
+            old_output = output
             if self.mode == "add":
-                output = ttnn.add(output, vel_feat)
+                output = ttnn.add(old_output, vel_feat)
             else:
-                output = ttnn.concat([output, vel_feat], dim=-1)
+                output = ttnn.concat([old_output, vel_feat], dim=-1)
+            ttnn.synchronize_device(self.device)
+            ttnn.deallocate(old_output)
+            ttnn.deallocate(vel_feat)
+            logger.debug(f"Encoder.run: vel combine done, output={output.shape}")
 
         if self.has_output_fc:
             output = self._run_layers(output, self.out_layers)
 
+        logger.debug(f"Encoder.run: reshape start, target=({bs}, {num_anchor}, {self.output_dims}), current={output.shape}")
         output = ttnn.reshape(output, (bs, num_anchor, self.output_dims))
+        ttnn.synchronize_device(self.device)
+        logger.debug(f"Encoder.run: done, output={output.shape}")
         return output
+
+    def _run_host(
+        self,
+        box_pt: torch.Tensor,
+        bs: int,
+        num_anchor: int,
+        n: int,
+    ) -> ttnn.Tensor:
+        """Run encoder entirely on host (PyTorch float32) for maximum precision.
+
+        The encoder processes small tensors ([bs, 900, 11] → [bs, 900, 256]),
+        so host compute has negligible PCIe overhead compared to accuracy gain.
+        """
+        logger.debug("Encoder._run_host: start")
+        pos_in = box_pt[:, :, X:Z+1].contiguous().reshape(n, 3)
+        size_in = box_pt[:, :, W:H+1].contiguous().reshape(n, 3)
+        yaw_in = box_pt[:, :, SIN_YAW:COS_YAW+1].contiguous().reshape(n, 2)
+
+        with torch.no_grad():
+            pos_feat = self._run_layers_host(pos_in, self.pos_layers_host)
+            size_feat = self._run_layers_host(size_in, self.size_layers_host)
+            yaw_feat = self._run_layers_host(yaw_in, self.yaw_layers_host)
+
+            if self.mode == "add":
+                output = pos_feat + size_feat + yaw_feat
+            else:
+                output = torch.cat([pos_feat, size_feat, yaw_feat], dim=-1)
+
+            if self.vel_dims > 0:
+                vel_in = box_pt[:, :, VX:VX+self.vel_dims].contiguous().reshape(n, self.vel_dims)
+                vel_feat = self._run_layers_host(vel_in, self.vel_layers_host)
+                if self.mode == "add":
+                    output = output + vel_feat
+                else:
+                    output = torch.cat([output, vel_feat], dim=-1)
+
+            if self.has_output_fc:
+                output = self._run_layers_host(output, self.out_layers_host)
+
+        output = output.reshape(bs, num_anchor, self.output_dims)
+        logger.debug(f"Encoder._run_host: done, shape={output.shape}")
+
+        return ttnn.from_torch(
+            output, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
+        )
 
 
 def _extract_linear_relu_ln_params(sequential_module):
