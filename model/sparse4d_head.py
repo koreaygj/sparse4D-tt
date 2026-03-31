@@ -315,7 +315,17 @@ class Sparse4DHead:
             temp_anchor_embed = None
             num_temp = 0
 
-        # 3. Decoder loop
+        # 3. Pre-allocate projection_mat and image_wh on device (reused across decoder loop)
+        proj_tt = ttnn.from_torch(
+            metas["projection_mat"].float(),
+            layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
+        )
+        wh_tt = ttnn.from_torch(
+            metas["image_wh"].float(),
+            layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
+        )
+
+        # 4. Decoder loop
         prediction = []
         classification = []
         quality = []
@@ -375,21 +385,11 @@ class Sparse4DHead:
 
             elif op == "deformable":
                 dfa = self.layers[i]
-                proj_tt = ttnn.from_torch(
-                    metas["projection_mat"].float(),
-                    layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
-                )
-                wh_tt = ttnn.from_torch(
-                    metas["image_wh"].float(),
-                    layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
-                )
                 instance_feature = dfa.run(
                     instance_feature, anchor, anchor_embed,
                     feature_maps, proj_tt, wh_tt,
                     self.spatial_shapes, bs=bs, num_anchor=num_anchor,
                 )
-                ttnn.deallocate(proj_tt)
-                ttnn.deallocate(wh_tt)
 
             elif op == "ffn":
                 ffn = self.layers[i]
@@ -455,7 +455,11 @@ class Sparse4DHead:
                 if op == "refine":
                     debug_intermediates[f"step_{i}_anchor"] = ttnn.to_torch(anchor)
 
-        # 4. Cache for next frame
+        # 5. Deallocate projection_mat and image_wh
+        ttnn.deallocate(proj_tt)
+        ttnn.deallocate(wh_tt)
+
+        # 6. Cache for next frame
         last_cls = classification[-1]
         if last_cls is not None:
             self.instance_bank.cache(
