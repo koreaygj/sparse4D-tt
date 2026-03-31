@@ -621,44 +621,31 @@ class DeformableFeatureAggregation:
         bs: int,
         num_anchor: int,
     ) -> ttnn.Tensor:
-        """Weighted fusion on device.
+        """Weighted fusion on device via repeat_interleave + element-wise multiply + sum.
 
         Args:
             features: [bs*num_anchor, cams*levels*pts, embed_dims] on device
             weights: [bs*num_anchor, cams*levels*pts, num_groups] on device
 
         Returns:
-            output: [bs*num_anchor, embed_dims] on device
+            output: [1, 1, bs*num_anchor, embed_dims] on device
         """
         total_clp = self.num_cams * self.num_levels * self.num_pts
         n = bs * num_anchor  # 900
 
-        # Use matmul instead of multiply+sum(dim=1) for efficiency
-        # Original: features[n,clp,G,D] * weights[n,clp,G,1] → sum(dim=1) → [n,G,D]
-        # Matmul:   weights[n*G,1,clp] @ features[n*G,clp,D] → [n*G,1,D]
-        logger.debug(f"fusion: matmul approach, n={n}, clp={total_clp}, groups={self.num_groups}")
+        # Expand weights [n, clp, G] → [n, clp, embed_dims] by repeating each group value D times
+        # repeat_interleave on 2D: [n*clp, G] → [n*clp, G*D=embed_dims]
+        weights = ttnn.reshape(weights, (n * total_clp, self.num_groups))
+        weights = ttnn.repeat_interleave(weights, self.group_dims, dim=-1)
+        weights = ttnn.reshape(weights, (n, total_clp, self.embed_dims))
 
-        # features: [n, clp, embed_dims] → [n, clp, G, D] → [n, G, clp, D] → [n*G, clp, D]
-        features = ttnn.reshape(features, (n, total_clp, self.num_groups, self.group_dims))
-        features = ttnn.transpose(features, 1, 2)  # [n, G, clp, D]
-        features = ttnn.reshape(features, (n * self.num_groups, total_clp, self.group_dims))
-
-        # weights: [n, clp, G] → [n, G, clp] → [n*G, 1, clp]
-        weights = ttnn.transpose(weights, -2, -1)  # [n, G, clp]
-        weights = ttnn.reshape(weights, (n * self.num_groups, 1, total_clp))
-        logger.debug("fusion: reshape done")
-
-        # matmul: [n*G, 1, clp] @ [n*G, clp, D] = [n*G, 1, D]
-        summed = ttnn.matmul(weights, features, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-        logger.debug("fusion: matmul done")
-        ttnn.deallocate(features)
+        # Element-wise multiply + sum over clp dimension
+        features = ttnn.multiply(features, weights)
         ttnn.deallocate(weights)
+        features = ttnn.sum(features, dim=1)
 
-        # Reshape: [n*G, 1, D] → [n, G, D] → [1, 1, n, embed_dims]
-        features = ttnn.reshape(summed, (n, self.num_groups, self.group_dims))
+        # Reshape: [n, 1, embed_dims] → [1, 1, n, embed_dims]
         features = ttnn.reshape(features, (1, 1, n, self.embed_dims))
-        logger.debug("fusion: final reshape done")
 
         return features
 
