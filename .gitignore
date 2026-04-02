@@ -19,3 +19,7 @@ debug/
 
 # Documents
 *.pdf
+
+# AI
+.claude/
+logs/
