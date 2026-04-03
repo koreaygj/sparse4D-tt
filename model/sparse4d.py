@@ -183,6 +183,7 @@ class Sparse4DInference:
         self._fpn_dev1 = None       # second FPN on submesh 1
         self._submesh0 = None
         self._submesh1 = None
+        self._mesh_device = None
 
     @classmethod
     def from_pytorch(
@@ -423,19 +424,16 @@ class Sparse4DInference:
         Returns:
             dict with 'prediction', 'classification', 'quality'
         """
-        # Mesh parallel mode: backbone+FPN on 2 submeshes in parallel
+        # Mesh parallel mode: backbone+FPN on 2 submeshes, features as mesh tensors
         if self.mesh_parallel_mode:
             feature_maps = self._extract_features_mesh_parallel(images)
         elif self.dual_device_mode:
             feature_maps = self._extract_features_dual_device(images)
         else:
-            # 1. Preprocess & send to device(s)
             input_tensor = self.preprocess_images(images)
-            # 2. Backbone + FPN
             feature_maps = self.extract_features(input_tensor)
 
-        # 3. Head decoder (always on single device)
-        logger.debug("Running Sparse4DHead...")
+        # 3. Head decoder
         outputs = self.head.forward(feature_maps, metas, bs=bs)
 
         return outputs
@@ -534,99 +532,82 @@ class Sparse4DInference:
         return fpn_combined
 
     def _extract_features_mesh_parallel(self, images: torch.Tensor) -> list:
-        """Run backbone+FPN on 2 submeshes in parallel within same process.
+        """Run backbone+FPN on mesh device SPMD (batch=3 per device).
 
-        Submesh 0 (device 0): cam0-2, batch=3
-        Submesh 1 (device 1): cam3-5, batch=3
-
-        Both backbones are dispatched before synchronizing, achieving
-        true parallel execution on 2 chips. No process spawn needed.
+        Input [6, 3, 256, 704] → ShardTensorToMesh(dim=0) → each device gets [3, 3, 256, 704]
+        Backbone + FPN run identically on both devices (SPMD).
+        Output: mesh tensors with 3 cameras per device (already sharded).
 
         Args:
             images: [bs, 6, 3, 256, 704] normalized images
 
         Returns:
-            list of FPN feature maps [p2, p3, p4, p5] on submesh 0 (float32)
+            list of FPN feature maps as mesh tensors (sharded by camera)
         """
         imgs_flat = images.reshape(self.num_cams, 3, 256, 704)
 
-        # Prepare inputs for both submeshes
-        imgs0 = imgs_flat[:3].permute(0, 2, 3, 1).contiguous().reshape(1, 1, 3 * 256 * 704, 3)
-        imgs1 = imgs_flat[3:].permute(0, 2, 3, 1).contiguous().reshape(1, 1, 3 * 256 * 704, 3)
+        # NHWC + flatten: [6, 256, 704, 3] → [1, 1, 6*256*704, 3]
+        # But we need to shard so each device gets 3 cams.
+        # Shard as [2, 1, 3*256*704, 3] along dim=0 → each device gets [1, 1, 3*H*W, 3]
+        imgs_nhwc = imgs_flat.permute(0, 2, 3, 1).contiguous()  # [6, 256, 704, 3]
+        # Split into 2 halves: [3, 256, 704, 3] each, flatten to [1, 1, 3*H*W, 3]
+        imgs_flat_0 = imgs_nhwc[:3].reshape(1, 1, 3 * 256 * 704, 3)
+        imgs_flat_1 = imgs_nhwc[3:].reshape(1, 1, 3 * 256 * 704, 3)
+        # Stack along dim=0 for ShardTensorToMesh
+        imgs_stacked = torch.cat([imgs_flat_0, imgs_flat_1], dim=0)  # [2, 1, 3*H*W, 3]
 
-        tt_x0 = ttnn.from_torch(
-            imgs0.float(), layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self._submesh0, dtype=self.activation_dtype,
+        tt_input = ttnn.from_torch(
+            imgs_stacked.float(),
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self._mesh_device,
+            dtype=self.activation_dtype,
+            mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=0),
         )
-        tt_x1 = ttnn.from_torch(
-            imgs1.float(), layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self._submesh1, dtype=self.activation_dtype,
-        )
 
-        # Dispatch backbone on both submeshes (parallel)
-        logger.debug("Mesh parallel: dispatching backbone on 2 submeshes...")
-        bb_features_0 = self.backbone(tt_x0)
-        bb_features_1 = self._backbone_dev1(tt_x1)
-
-        # Sync both
-        ttnn.synchronize_device(self._submesh0)
-        ttnn.synchronize_device(self._submesh1)
-        logger.debug("Mesh parallel: backbone done on both submeshes")
+        # Backbone SPMD: each device processes its 3 cameras
+        logger.debug("Mesh SPMD: backbone start")
+        backbone_features = self.backbone(tt_input)
+        logger.debug("Mesh SPMD: backbone done")
 
         # Upcast if needed
-        bb_features_0 = [
+        backbone_features = [
             ttnn.typecast(f, self.activation_dtype)
             if f.dtype != self.activation_dtype and f.dtype == ttnn.bfloat8_b
             else f
-            for f in bb_features_0
-        ]
-        bb_features_1 = [
-            ttnn.typecast(f, self.activation_dtype)
-            if f.dtype != self.activation_dtype and f.dtype == ttnn.bfloat8_b
-            else f
-            for f in bb_features_1
+            for f in backbone_features
         ]
 
-        # FPN on both submeshes (parallel)
-        logger.debug("Mesh parallel: dispatching FPN on 2 submeshes...")
-        fpn_features_0 = self.fpn.run(bb_features_0, self._submesh0)
-        fpn_features_1 = self._fpn_dev1.run(bb_features_1, self._submesh1)
-        ttnn.synchronize_device(self._submesh0)
-        ttnn.synchronize_device(self._submesh1)
-        logger.debug("Mesh parallel: FPN done on both submeshes")
-
-        # Gather FPN results to host and concat
-        fpn_combined = []
-        for level_idx in range(4):
-            f0_torch = ttnn.to_torch(fpn_features_0[level_idx]).float()
-            f1_torch = ttnn.to_torch(fpn_features_1[level_idx]).float()
-            ttnn.deallocate(fpn_features_0[level_idx])
-            ttnn.deallocate(fpn_features_1[level_idx])
-            combined = torch.cat([f0_torch, f1_torch], dim=2)  # [1,1,6*H*W,256]
-            f_tt = ttnn.from_torch(
-                combined,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                device=self._submesh0,
-                dtype=ttnn.float32,
-            )
-            fpn_combined.append(f_tt)
+        # FPN SPMD
+        logger.debug("Mesh SPMD: FPN start")
+        fpn_features = self.fpn.run(backbone_features, self._mesh_device)
+        logger.debug("Mesh SPMD: FPN done")
 
         # Deallocate backbone features
-        for bf in bb_features_0 + bb_features_1:
+        for bf in backbone_features:
             try:
                 ttnn.deallocate(bf)
             except Exception:
                 pass
 
-        logger.debug("Mesh parallel: FPN features combined on submesh 0")
-        return fpn_combined
+        # Pre-reshape for DFA grid_sample: [1,1,3*H*W,256] → [3, H, W, 256]
+        for level_idx in range(4):
+            h, w = SPATIAL_SHAPES[level_idx]
+            f = fpn_features[level_idx]
+            f = ttnn.to_memory_config(f, ttnn.DRAM_MEMORY_CONFIG)
+            f = ttnn.to_layout(f, ttnn.ROW_MAJOR_LAYOUT)
+            f = ttnn.reshape(f, (3, h, w, 256))
+            if f.dtype != ttnn.bfloat16:
+                f = ttnn.typecast(f, ttnn.bfloat16)
+            fpn_features[level_idx] = f
+
+        logger.debug("Mesh SPMD: FPN features reshaped for DFA")
+        return fpn_features
 
     def reset(self):
         """Reset temporal state (call at start of new sequence)."""
         self.head.instance_bank.reset()
 
-    @staticmethod
-    def post_process(outputs: dict, score_threshold: float = 0.3):
+    def post_process(self, outputs: dict, score_threshold: float = 0.3):
         """Decode predictions to 3D bounding boxes.
 
         Args:
@@ -645,8 +626,13 @@ class Sparse4DInference:
 
         # To host
         if hasattr(prediction, 'dtype') and hasattr(ttnn, 'to_torch'):
-            pred = ttnn.to_torch(prediction).float()
-            cls = ttnn.to_torch(classification).float()
+            if self._mesh_device is not None:
+                composer = ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)
+                pred = ttnn.to_torch(prediction, mesh_composer=composer).float()[:1]
+                cls = ttnn.to_torch(classification, mesh_composer=composer).float()[:1]
+            else:
+                pred = ttnn.to_torch(prediction).float()
+                cls = ttnn.to_torch(classification).float()
         else:
             pred = prediction.float()
             cls = classification.float()

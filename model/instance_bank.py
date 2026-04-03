@@ -46,8 +46,10 @@ class InstanceBank:
         default_time_interval: float = 0.5,
         confidence_decay: float = 0.6,
         max_time_interval: float = 2.0,
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.num_anchor = num_anchor
         self.embed_dims = embed_dims
         self.num_temp_instances = num_temp_instances
@@ -60,6 +62,19 @@ class InstanceBank:
         self.instance_feature_data = instance_feature_data.float()  # [num_anchor, embed_dims]
 
         self.reset()
+
+    def _to_dev(self, tensor: torch.Tensor) -> ttnn.Tensor:
+        """Helper: from_torch with mesh_mapper if mesh mode."""
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
+
+    def _from_dev(self, tensor: ttnn.Tensor) -> torch.Tensor:
+        """Helper: to_torch with mesh_composer if mesh mode."""
+        if self._mesh_device is not None:
+            return ttnn.to_torch(tensor, mesh_composer=ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)).float()[:1]
+        return ttnn.to_torch(tensor).float()
 
     def reset(self):
         """Reset temporal cache."""
@@ -100,7 +115,7 @@ class InstanceBank:
 
             # Anchor projection: transform cached anchors to current frame
             # Done on host since it requires numpy metas (T_global matrices)
-            cached_anchor_pt = ttnn.to_torch(self.cached_anchor)
+            cached_anchor_pt = self._from_dev(self.cached_anchor)
             T_temp2cur = torch.tensor(
                 np.stack([
                     x["T_global_inv"] @ self.metas["img_metas"][i]["T_global"]
@@ -119,9 +134,7 @@ class InstanceBank:
                 torch.tensor(self.default_time_interval, dtype=time_interval_pt.dtype),
             )
 
-            cached_anchor = ttnn.from_torch(
-                cached_anchor_pt.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-            )
+            cached_anchor = self._to_dev(cached_anchor_pt)
             cached_feature = self.cached_feature  # already on device
         else:
             self.reset()
@@ -130,18 +143,9 @@ class InstanceBank:
             )
 
         # Move to device
-        instance_feature = ttnn.from_torch(
-            feature_tiled, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
-        anchor = ttnn.from_torch(
-            anchor_tiled, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
-        time_interval = ttnn.from_torch(
-            time_interval_pt.reshape(1, 1, 1, bs),
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            dtype=ttnn.float32,
-        )
+        instance_feature = self._to_dev(feature_tiled)
+        anchor = self._to_dev(anchor_tiled)
+        time_interval = self._to_dev(time_interval_pt.reshape(1, 1, 1, bs))
         time_interval = ttnn.reshape(time_interval, (bs,))
 
         return instance_feature, anchor, cached_feature, cached_anchor, time_interval
@@ -171,15 +175,15 @@ class InstanceBank:
         N = self.num_anchor - self.num_temp_instances  # 300
 
         # confidence max over classes: [bs, num_anchor, num_cls] → [bs, num_anchor]
-        conf_pt = ttnn.to_torch(confidence).float()
+        conf_pt = self._from_dev(confidence)
         conf_max = conf_pt.max(dim=-1).values  # [bs, num_anchor]
 
         # topk: select top-N by confidence
         _, top_indices = torch.topk(conf_max, N, dim=1)  # [bs, N]
 
         # Gather selected features and anchors on host
-        inst_pt = ttnn.to_torch(instance_feature).float()
-        anch_pt = ttnn.to_torch(anchor).float()
+        inst_pt = self._from_dev(instance_feature)
+        anch_pt = self._from_dev(anchor)
 
         selected_feature = torch.gather(
             inst_pt, 1,
@@ -191,8 +195,8 @@ class InstanceBank:
         )
 
         # Concat cached + selected
-        cached_feat_pt = ttnn.to_torch(self.cached_feature).float()
-        cached_anch_pt = ttnn.to_torch(self.cached_anchor).float()
+        cached_feat_pt = self._from_dev(self.cached_feature)
+        cached_anch_pt = self._from_dev(self.cached_anchor)
         merged_feature = torch.cat([cached_feat_pt, selected_feature], dim=1)
         merged_anchor = torch.cat([cached_anch_pt, selected_anchor], dim=1)
 
@@ -202,12 +206,8 @@ class InstanceBank:
         out_anchor = torch.where(mask, merged_anchor, anch_pt)
 
         # Back to device
-        instance_feature = ttnn.from_torch(
-            out_feature, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
-        anchor = ttnn.from_torch(
-            out_anchor, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        instance_feature = self._to_dev(out_feature)
+        anchor = self._to_dev(out_anchor)
 
         return instance_feature, anchor
 
@@ -234,12 +234,12 @@ class InstanceBank:
         self.metas = metas
 
         # confidence: max over classes → sigmoid
-        conf_pt = ttnn.to_torch(confidence).float()
+        conf_pt = self._from_dev(confidence)
         conf_scores = conf_pt.max(dim=-1).values.sigmoid()  # [bs, num_anchor]
 
         # Apply confidence decay to previously cached instances
         if self.confidence is not None:
-            prev_conf = ttnn.to_torch(self.confidence).float().squeeze()
+            prev_conf = self._from_dev(self.confidence).squeeze()
             if prev_conf.dim() == 1:
                 prev_conf = prev_conf.unsqueeze(0)
             decayed = prev_conf * self.confidence_decay
@@ -252,8 +252,8 @@ class InstanceBank:
             conf_scores, self.num_temp_instances, dim=1
         )
 
-        inst_pt = ttnn.to_torch(instance_feature).float()
-        anch_pt = ttnn.to_torch(anchor).float()
+        inst_pt = self._from_dev(instance_feature)
+        anch_pt = self._from_dev(anchor)
 
         cached_feature = torch.gather(
             inst_pt, 1,
@@ -264,18 +264,9 @@ class InstanceBank:
             top_indices.unsqueeze(-1).expand(-1, -1, anch_pt.shape[-1]),
         )
 
-        self.cached_feature = ttnn.from_torch(
-            cached_feature, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
-        self.cached_anchor = ttnn.from_torch(
-            cached_anchor, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
-        self.confidence = ttnn.from_torch(
-            top_conf.reshape(1, 1, bs, self.num_temp_instances),
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            dtype=ttnn.float32,
-        )
+        self.cached_feature = self._to_dev(cached_feature)
+        self.cached_anchor = self._to_dev(cached_anchor)
+        self.confidence = self._to_dev(top_conf.reshape(1, 1, bs, self.num_temp_instances))
 
     @staticmethod
     def _anchor_projection(

@@ -45,8 +45,10 @@ class DeformableFeatureAggregation:
         num_learnable_pts: int = 6,
         use_camera_embed: bool = True,
         residual_mode: str = "cat",
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.embed_dims = embed_dims
         self.num_groups = num_groups
         self.group_dims = embed_dims // num_groups  # 32
@@ -61,25 +63,19 @@ class DeformableFeatureAggregation:
         # HiFi compute config for precision-sensitive operations
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi4,
-            fp32_dest_acc_en=True,
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=False,
             packer_l1_acc=False,
             math_approx_mode=False,
         )
 
         # Pre-allocate scalar constants on device (reused per camera in _project_points)
-        self._scalar_two = ttnn.from_torch(
-            torch.full((1, 1, 1), 2.0),
-            layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.float32,
-        )
-        self._scalar_one = ttnn.from_torch(
-            torch.full((1, 1, 1), 1.0),
-            layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.float32,
-        )
-        self._scalar_half = ttnn.from_torch(
-            torch.full((1, 1, 1), 0.5),
-            layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.float32,
-        )
+        _skw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            _skw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        self._scalar_two = ttnn.from_torch(torch.full((1, 1, 1), 2.0), **_skw)
+        self._scalar_one = ttnn.from_torch(torch.full((1, 1, 1), 1.0), **_skw)
+        self._scalar_half = ttnn.from_torch(torch.full((1, 1, 1), 0.5), **_skw)
 
         # --- Move all parameters to TT device ---
         # Note: PyTorch nn.Linear stores weight as [out, in],
@@ -129,25 +125,28 @@ class DeformableFeatureAggregation:
         """Move weight tensor to device in TILE layout."""
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
-        if tensor.dim() == 2:
-            # Pad to tile-aligned if needed
-            pass
-        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        return t
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move bias tensor to device as [1, 1, 1, N] in TILE layout."""
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        return t
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move 1D tensor (LayerNorm weight/bias) to device as [1, 1, 1, N]."""
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        t = ttnn.from_torch(tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        return t
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _kps_generator(
         self,
@@ -172,7 +171,6 @@ class DeformableFeatureAggregation:
             anchor, [0, 0, W], [bs, num_anchor, H + 1]
         )  # [bs, num_anchor, 3]
         size = ttnn.exp(size_wlh)  # [bs, num_anchor, 3]
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(size_wlh)
         logger.debug("_kps_generator: slice+exp done")
 
@@ -182,7 +180,6 @@ class DeformableFeatureAggregation:
         # Fixed key points: fix_scale [7, 3] * size [bs*num_anchor, 1, 3]
         fix_scale_3d = ttnn.reshape(self.fix_scale, (1, 7, 3))
         fix_kps = ttnn.multiply(fix_scale_3d, size_3d)  # [bs*num_anchor, 7, 3]
-        ttnn.synchronize_device(self.device)
         logger.debug("_kps_generator: fix_kps done")
 
         # Learnable key points
@@ -193,7 +190,6 @@ class DeformableFeatureAggregation:
             inst_flat, self.learnable_fc_weight, bias=self.learnable_fc_bias,
             compute_kernel_config=self._hifi_compute_config,
         )  # [1, 1, bs*num_anchor, 18]
-        ttnn.synchronize_device(self.device)
         logger.debug("_kps_generator: learnable linear done")
 
         learnable = ttnn.reshape(
@@ -202,22 +198,26 @@ class DeformableFeatureAggregation:
         learnable = ttnn.sigmoid(learnable)
         learnable = ttnn.subtract(learnable, self._scalar_half)  # sigmoid - 0.5
         learnable_kps = ttnn.multiply(learnable, size_3d)  # [bs*num_anchor, 6, 3]
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(learnable)
         # Note: size_3d is a reshape (view) of size, don't deallocate separately
         logger.debug("_kps_generator: learnable_kps done")
 
         # Concat fixed + learnable: [bs*num_anchor, 13, 3]
         key_points = ttnn.concat([fix_kps, learnable_kps], dim=1)
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(fix_kps)
         ttnn.deallocate(learnable_kps)
         logger.debug("_kps_generator: concat done")
 
         # --- Host fallback for rotation + translation (small tensors, avoids TILE hang) ---
-        key_points_torch = ttnn.to_torch(key_points)  # [bs*num_anchor, 13, 3]
-        ttnn.deallocate(key_points)
-        anchor_torch = ttnn.to_torch(anchor)  # [bs, num_anchor, 11]
+        if self._mesh_device is not None:
+            _composer = ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)
+            key_points_torch = ttnn.to_torch(key_points, mesh_composer=_composer)[:bs * num_anchor]
+            ttnn.deallocate(key_points)
+            anchor_torch = ttnn.to_torch(anchor, mesh_composer=_composer)[:bs]
+        else:
+            key_points_torch = ttnn.to_torch(key_points)  # [bs*num_anchor, 13, 3]
+            ttnn.deallocate(key_points)
+            anchor_torch = ttnn.to_torch(anchor)  # [bs, num_anchor, 11]
 
         cos_yaw = anchor_torch[:, :, COS_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
         sin_yaw = anchor_torch[:, :, SIN_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
@@ -237,12 +237,12 @@ class DeformableFeatureAggregation:
 
         # Reshape to [bs, num_anchor*num_pts, 3] and send back to device
         key_points_torch = key_points_torch.reshape(bs, num_anchor * self.num_pts, 3)
-        key_points = ttnn.from_torch(
-            key_points_torch.float(),
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            dtype=ttnn.float32,
-        )
+        # Use float32 for key_points (feeds into projection → grid_sample)
+        _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+        if self._mesh_device is not None:
+            _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        key_points = ttnn.from_torch(key_points_torch.float(), **_kw_f32)
+        del key_points_torch, anchor_torch
         logger.debug("_kps_generator: rotation+translate (host) done")
 
         return key_points
@@ -268,12 +268,11 @@ class DeformableFeatureAggregation:
         n_pts_total = num_anchor * self.num_pts
 
         # Append ones for homogeneous: [bs, n_pts_total, 4]
-        ones = ttnn.from_torch(
-            torch.ones(bs, n_pts_total, 1),
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            dtype=ttnn.float32,
-        )
+        # Use float32 for projection (grid_sample requires float32 grid)
+        _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+        if self._mesh_device is not None:
+            _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        ones = ttnn.from_torch(torch.ones(bs, n_pts_total, 1), **_kw_f32)
         pts_homo = ttnn.concat([key_points, ones], dim=-1)  # [bs, n_pts_total, 4]
 
         # Per-camera projection via loop (avoid 6D tensor)
@@ -289,7 +288,6 @@ class DeformableFeatureAggregation:
 
             proj_t = ttnn.transpose(proj, -2, -1)
             projected = ttnn.matmul(pts_homo, proj_t, compute_kernel_config=self._hifi_compute_config)
-            ttnn.synchronize_device(self.device)
             ttnn.deallocate(proj)
             ttnn.deallocate(proj_t)
             logger.debug(f"DFA _project_points: cam {cam_idx} matmul done")
@@ -299,7 +297,6 @@ class DeformableFeatureAggregation:
             z_clamped = ttnn.clamp(z, min=1e-5)
             z_recip = ttnn.reciprocal(z_clamped)
             xy_div = ttnn.multiply(xy, z_recip)
-            ttnn.synchronize_device(self.device)
             ttnn.deallocate(projected)
             ttnn.deallocate(xy)
             ttnn.deallocate(z)
@@ -315,7 +312,6 @@ class DeformableFeatureAggregation:
 
             xy_scaled = ttnn.multiply(xy_norm, self._scalar_two)
             xy_grid = ttnn.subtract(xy_scaled, self._scalar_one)
-            ttnn.synchronize_device(self.device)
             ttnn.deallocate(xy_div)
             ttnn.deallocate(wh_recip)
             ttnn.deallocate(xy_norm)
@@ -348,7 +344,6 @@ class DeformableFeatureAggregation:
             for s in interleaved:
                 ttnn.deallocate(s)
 
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(pts_homo)
         ttnn.deallocate(ones)
         for p in all_cam_points:
@@ -391,7 +386,6 @@ class DeformableFeatureAggregation:
         x = ttnn.relu(x)
         relu_out = x
         x = ttnn.layer_norm(x, weight=self.cam_ln2_weight, bias=self.cam_ln2_bias, epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(relu_in)
         ttnn.deallocate(relu_out)
 
@@ -406,6 +400,7 @@ class DeformableFeatureAggregation:
         projection_mat: ttnn.Tensor,
         bs: int,
         num_anchor: int,
+        return_logits: bool = False,
     ) -> ttnn.Tensor:
         """Compute attention weights on device.
 
@@ -426,7 +421,6 @@ class DeformableFeatureAggregation:
                 camera_embed, (bs, 1, self.num_cams, self.embed_dims)
             )
             feature = ttnn.add(feat_exp, cam_exp)
-            ttnn.synchronize_device(self.device)
             ttnn.deallocate(camera_embed)
             feature = ttnn.reshape(
                 feature, (1, 1, bs * num_anchor * self.num_cams, self.embed_dims)
@@ -438,7 +432,6 @@ class DeformableFeatureAggregation:
             feature, self.weights_fc_weight, bias=self.weights_fc_bias,
             compute_kernel_config=self._hifi_compute_config,
         )
-        ttnn.synchronize_device(self.device)
 
         ttnn.deallocate(feature)
 
@@ -456,6 +449,9 @@ class DeformableFeatureAggregation:
             weights = ttnn.reshape(
                 weights, (bs * num_anchor, total_clp, self.num_groups)
             )
+
+        if return_logits:
+            return weights  # pre-softmax logits
 
         weights = ttnn.softmax(weights, dim=1, numeric_stable=True,
                                compute_kernel_config=self._hifi_compute_config)
@@ -485,34 +481,28 @@ class DeformableFeatureAggregation:
         """
         n_batch = bs * self.num_cams
 
-        # 1. grid_sample_lerp per level (lerp-based bilinear, device-only)
+        # Pre-convert grid once (reused across all levels)
+        grid = ttnn.to_layout(points_2d, ttnn.ROW_MAJOR_LAYOUT)
+        grid = ttnn.to_memory_config(grid, ttnn.DRAM_MEMORY_CONFIG)
+        if grid.dtype != ttnn.float32:
+            grid = ttnn.typecast(grid, ttnn.float32)
+
+        # 1. grid_sample_lerp per level
         all_level_features = []
         for level_idx, fm_tt in enumerate(feature_maps):
             h, w = spatial_shapes[level_idx]
-            logger.debug(f"==== DFA grid_sample_lerp level {level_idx}: spatial={h}x{w}")
 
             # Reshape feature map: [1, 1, N*H*W, C] -> [N, H, W, C] (NHWC)
             fm = ttnn.to_memory_config(fm_tt, ttnn.DRAM_MEMORY_CONFIG)
             fm = ttnn.to_layout(fm, ttnn.ROW_MAJOR_LAYOUT)
             fm = ttnn.reshape(fm, (n_batch, h, w, self.embed_dims))
 
-            # Grid: [bs*num_cams, num_anchor, num_pts, 2] — use float32 for precision
-            grid = ttnn.to_layout(points_2d, ttnn.ROW_MAJOR_LAYOUT)
-            grid = ttnn.to_memory_config(grid, ttnn.DRAM_MEMORY_CONFIG)
-            if grid.dtype != ttnn.float32:
-                grid = ttnn.typecast(grid, ttnn.float32)
-
-            sampled = ttnn.grid_sample_lerp(
-                fm, grid,
-                padding_mode="zeros",
-                align_corners=False,
-            )
-            # [bs*num_cams, num_anchor, num_pts, embed_dims]
-
+            sampled = ttnn.grid_sample_lerp(fm, grid, padding_mode="zeros", align_corners=False)
             sampled = ttnn.to_layout(sampled, ttnn.TILE_LAYOUT)
             sampled = ttnn.to_memory_config(sampled, ttnn.DRAM_MEMORY_CONFIG)
-
             all_level_features.append(sampled)
+
+        ttnn.deallocate(grid)
 
         # 2. Rearrange via slice + concat (no host transfer)
         #
@@ -681,7 +671,6 @@ class DeformableFeatureAggregation:
         # 1. Generate 3D key points
         logger.debug("DFA run: _kps_generator start")
         key_points = self._kps_generator(anchor, instance_feature, bs, num_anchor)
-        ttnn.synchronize_device(self.device)
         logger.debug("DFA run: _kps_generator done")
         # [bs, num_anchor*num_pts, 3]
 
@@ -712,12 +701,28 @@ class DeformableFeatureAggregation:
         logger.debug("DFA run: _multi_view_level_fusion done")
         ttnn.deallocate(points_2d)
 
+        # In mesh SPMD mode: each device has partial fusion (3 cams).
+        # Combine via host (all_reduce hangs on N300).
+        if self._mesh_device is not None:
+            logger.debug("DFA run: mesh combine start")
+            composer = ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)
+            partials = ttnn.to_torch(features, mesh_composer=composer).float()
+            combined = partials[:1] + partials[1:]
+            del partials
+            ttnn.deallocate(features)
+            features = ttnn.from_torch(
+                combined, layout=ttnn.TILE_LAYOUT, device=self._mesh_device,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self._mesh_device),
+            )
+            del combined
+            logger.debug("DFA run: mesh combine done")
+
         logger.debug("DFA run: output_proj start")
         output = ttnn.linear(
             features, self.output_proj_weight, bias=self.output_proj_bias,
             compute_kernel_config=self._hifi_compute_config,
         )
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(features)
         logger.debug("DFA run: output_proj done")
 

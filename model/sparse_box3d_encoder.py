@@ -47,14 +47,16 @@ class SparseBox3DEncoder:
         in_loops: int = 1,
         out_loops: int = 4,
         use_host_compute: bool = True,
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.vel_dims = vel_dims
         self.mode = mode
         self._use_host_compute = use_host_compute
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
-            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
-            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
         self.has_output_fc = has_output_fc
 
@@ -136,23 +138,26 @@ class SparseBox3DEncoder:
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _run_layers(self, x: ttnn.Tensor, layers: list, name: str = "") -> ttnn.Tensor:
         """Run Linear→ReLU (→LN) chain."""
@@ -160,7 +165,6 @@ class SparseBox3DEncoder:
             logger.debug(f"Encoder._run_layers[{name}][{idx}]: linear start, x={x.shape}")
             linear_in = x
             x = ttnn.linear(x, entry["weight"], bias=entry["bias"], compute_kernel_config=self._hifi_compute_config)
-            ttnn.synchronize_device(self.device)
             # Deallocate linear input (skip idx=0: caller owns input)
             if idx > 0:
                 ttnn.deallocate(linear_in)
@@ -175,7 +179,6 @@ class SparseBox3DEncoder:
                     epsilon=1e-5,
                     compute_kernel_config=self._hifi_compute_config,
                 )
-                ttnn.synchronize_device(self.device)
                 ttnn.deallocate(relu_in)
                 ttnn.deallocate(relu_out)
                 logger.debug(f"Encoder._run_layers[{name}][{idx}]: layer_norm done")
@@ -199,7 +202,10 @@ class SparseBox3DEncoder:
         """
         # Extract components via host slice (avoid ttnn.slice hang on submesh)
         logger.debug(f"Encoder.run: slice start, box_3d={box_3d.shape}, bs={bs}, num_anchor={num_anchor}")
-        box_pt = ttnn.to_torch(box_3d).float()
+        if self._mesh_device is not None:
+            box_pt = ttnn.to_torch(box_3d, mesh_composer=ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)).float()[:bs]
+        else:
+            box_pt = ttnn.to_torch(box_3d).float()
         n = bs * num_anchor
 
         # Host compute path: run Linear→ReLU→LN chains on CPU for higher precision
@@ -210,26 +216,26 @@ class SparseBox3DEncoder:
         size_pt = box_pt[:, :, W:H+1].contiguous().reshape(1, 1, n, 3)
         yaw_pt = box_pt[:, :, SIN_YAW:COS_YAW+1].contiguous().reshape(1, 1, n, 2)
 
-        pos = ttnn.from_torch(pos_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        size = ttnn.from_torch(size_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        yaw = ttnn.from_torch(yaw_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+        _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        pos = ttnn.from_torch(pos_pt, **_kw)
+        size = ttnn.from_torch(size_pt, **_kw)
+        yaw = ttnn.from_torch(yaw_pt, **_kw)
         logger.debug("Encoder.run: slice done")
 
         logger.debug("Encoder.run: pos_layers start")
         pos_feat = self._run_layers(pos, self.pos_layers, name="pos")
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(pos)
         logger.debug("Encoder.run: pos_layers done")
 
         logger.debug("Encoder.run: size_layers start")
         size_feat = self._run_layers(size, self.size_layers, name="size")
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(size)
         logger.debug("Encoder.run: size_layers done")
 
         logger.debug("Encoder.run: yaw_layers start")
         yaw_feat = self._run_layers(yaw, self.yaw_layers, name="yaw")
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(yaw)
         logger.debug("Encoder.run: yaw_layers done")
 
@@ -237,7 +243,6 @@ class SparseBox3DEncoder:
             output = ttnn.add(ttnn.add(pos_feat, size_feat), yaw_feat)
         else:
             output = ttnn.concat([pos_feat, size_feat, yaw_feat], dim=-1)
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(pos_feat)
         ttnn.deallocate(size_feat)
         ttnn.deallocate(yaw_feat)
@@ -245,10 +250,12 @@ class SparseBox3DEncoder:
 
         if self.vel_dims > 0:
             vel_pt = box_pt[:, :, VX:VX+self.vel_dims].contiguous().reshape(1, 1, n, self.vel_dims)
-            vel = ttnn.from_torch(vel_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
+            _kw2 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+            if self._mesh_device is not None:
+                _kw2["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            vel = ttnn.from_torch(vel_pt, **_kw2)
             logger.debug("Encoder.run: vel_layers start")
             vel_feat = self._run_layers(vel, self.vel_layers, name="vel")
-            ttnn.synchronize_device(self.device)
             ttnn.deallocate(vel)
             logger.debug("Encoder.run: vel_layers done")
             logger.debug(f"Encoder.run: vel combine start, mode={self.mode}")
@@ -257,7 +264,6 @@ class SparseBox3DEncoder:
                 output = ttnn.add(old_output, vel_feat)
             else:
                 output = ttnn.concat([old_output, vel_feat], dim=-1)
-            ttnn.synchronize_device(self.device)
             ttnn.deallocate(old_output)
             ttnn.deallocate(vel_feat)
             logger.debug(f"Encoder.run: vel combine done, output={output.shape}")
@@ -267,7 +273,6 @@ class SparseBox3DEncoder:
 
         logger.debug(f"Encoder.run: reshape start, target=({bs}, {num_anchor}, {self.output_dims}), current={output.shape}")
         output = ttnn.reshape(output, (bs, num_anchor, self.output_dims))
-        ttnn.synchronize_device(self.device)
         logger.debug(f"Encoder.run: done, output={output.shape}")
         return output
 
@@ -312,9 +317,10 @@ class SparseBox3DEncoder:
         output = output.reshape(bs, num_anchor, self.output_dims)
         logger.debug(f"Encoder._run_host: done, shape={output.shape}")
 
-        return ttnn.from_torch(
-            output, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(output, **kwargs)
 
 
 def _extract_linear_relu_ln_params(sequential_module):

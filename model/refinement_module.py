@@ -44,12 +44,14 @@ class SparseBox3DRefinementModule:
         num_cls: int = 10,
         refine_yaw: bool = True,
         with_quality_estimation: bool = True,
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.embed_dims = embed_dims
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
-            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
-            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
         self.output_dim = output_dim
         self.num_cls = num_cls
@@ -92,23 +94,26 @@ class SparseBox3DRefinementModule:
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _run_layers(self, x: ttnn.Tensor, layers: list) -> ttnn.Tensor:
         for idx, entry in enumerate(layers):
@@ -123,11 +128,9 @@ class SparseBox3DRefinementModule:
                     epsilon=1e-5,
                     compute_kernel_config=self._hifi_compute_config,
                 )
-                ttnn.synchronize_device(self.device)
                 ttnn.deallocate(relu_in)
                 ttnn.deallocate(relu_out)
             else:
-                ttnn.synchronize_device(self.device)
                 ttnn.deallocate(relu_in)
             # Deallocate previous layer output (skip idx=0: caller owns input)
             if idx > 0:
@@ -175,7 +178,6 @@ class SparseBox3DRefinementModule:
         # Apply Scale
         refined_pre_scale = refined
         refined = ttnn.multiply(refined, self.refine_scale)
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(refined_pre_scale)
         refined = ttnn.reshape(refined, (bs, num_anchor, self.output_dim))
 
@@ -226,7 +228,7 @@ class SparseBox3DRefinementModule:
             output = ttnn.concat([refined_pos, refined_vel], dim=-1)
         else:
             output = ttnn.concat([refined_pos, refined_yaw, refined_vel], dim=-1)
-        ttnn.synchronize_device(self.device)
+
         ttnn.deallocate(refined_pos)
         ttnn.deallocate(refined_vel)
         if not self.refine_yaw:
@@ -252,7 +254,7 @@ class SparseBox3DRefinementModule:
                         cls_feat, weight=entry["ln_weight"], bias=entry["ln_bias"],
                         compute_kernel_config=self._hifi_compute_config,
                     )
-                    ttnn.synchronize_device(self.device)
+            
                     ttnn.deallocate(relu_in)
                     ttnn.deallocate(relu_out)
                 if layer_idx > 0:
@@ -262,7 +264,7 @@ class SparseBox3DRefinementModule:
                 cls_feat, self.cls_final_weight, bias=self.cls_final_bias,
                 compute_kernel_config=self._hifi_compute_config,
             )
-            ttnn.synchronize_device(self.device)
+    
             ttnn.deallocate(cls_feat)
 
             cls = ttnn.reshape(cls, (bs, num_anchor, self.num_cls))
@@ -275,7 +277,7 @@ class SparseBox3DRefinementModule:
                 qt_feat, self.quality_final_weight, bias=self.quality_final_bias,
                 compute_kernel_config=self._hifi_compute_config,
             )
-            ttnn.synchronize_device(self.device)
+    
             ttnn.deallocate(qt_feat)
             quality = ttnn.reshape(quality, (bs, num_anchor, 2))
 

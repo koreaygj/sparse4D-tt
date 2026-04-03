@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import copy
+import gc
 import json
 import os
 import pickle
@@ -341,7 +342,7 @@ def _build_encoder_params(sd, prefix):
     return params
 
 
-def _build_head_from_sd(sd, device):
+def _build_head_from_sd(sd, device, mesh_device=None):
     """Build TT Sparse4DHead from checkpoint state_dict."""
     layer_params = []
     for i, op in enumerate(OPERATION_ORDER):
@@ -382,6 +383,7 @@ def _build_head_from_sd(sd, device):
         num_classes=10,
         num_groups=8,
         spatial_shapes=SPATIAL_SHAPES,
+        mesh_device=mesh_device,
     )
     return head
 
@@ -409,7 +411,7 @@ def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp
     fpn = _build_fpn_from_sd(sd, device, batch_size=batch_size, fp32=fp32_backbone)
 
     print("  Building Sparse4DHead...")
-    head = _build_head_from_sd(sd, device)
+    head = _build_head_from_sd(sd, device, mesh_device=mesh_device)
 
     model = Sparse4DInference(device, backbone, fpn, head)
     print("  Model build complete.")
@@ -658,6 +660,7 @@ def postprocess_to_nuscenes(
     info,
     eval_config,
     max_dets=300,
+    mesh_device=None,
 ):
     """Convert TT-NN predictions to nuScenes detection format.
 
@@ -686,18 +689,18 @@ def postprocess_to_nuscenes(
         return []
 
     # To host
-    if isinstance(prediction, torch.Tensor):
-        pred = prediction.float()
-        cls = classification.float()
-    else:
-        pred = ttnn.to_torch(prediction).float()
-        cls = ttnn.to_torch(classification).float()
+    def _tt_to_torch(t, mesh_dev=None):
+        if isinstance(t, torch.Tensor):
+            return t.float()
+        if mesh_dev is not None:
+            return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_dev, dim=0)).float()[:1]
+        return ttnn.to_torch(t).float()
+
+    pred = _tt_to_torch(prediction, mesh_device)
+    cls = _tt_to_torch(classification, mesh_device)
 
     if quality is not None:
-        if isinstance(quality, torch.Tensor):
-            qt = quality.float()
-        else:
-            qt = ttnn.to_torch(quality).float()
+        qt = _tt_to_torch(quality, mesh_device)
         qt = qt[0]  # [num_anchor, num_quality]
     else:
         qt = None
@@ -1099,13 +1102,11 @@ def main():
     submeshes = None
 
     if args.dual_device and num_devices >= 2:
-        # Mesh parallel mode: 2 submeshes for backbone+FPN, Head on submesh 0
+        # Full mesh SPMD mode
         print(f"  {num_devices} chips detected, opening mesh (1x2)...")
         mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=24576)
-        submeshes = mesh_device.create_submeshes(ttnn.MeshShape(1, 1))
-        device = submeshes[0]  # Head runs on submesh 0
-        print(f"  Submesh 0: device {submeshes[0].get_device_ids()}")
-        print(f"  Submesh 1: device {submeshes[1].get_device_ids()}")
+        device = mesh_device  # everything runs on mesh
+        print(f"  Mesh device IDs: {mesh_device.get_device_ids()}")
     else:
         device = ttnn.open_device(device_id=0, l1_small_size=24576)
         if num_devices >= 2:
@@ -1114,56 +1115,16 @@ def main():
             print("  Single device mode")
 
     try:
-        grid = device.compute_with_storage_grid_size()
-        print(f"  Device: {device.arch()}, grid: {grid.x}x{grid.y}")
-
-        if args.dual_device and submeshes is not None:
-            # Mesh parallel: backbone batch=3 on each submesh, HiFi4+fp32_acc
-            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=3, fp32_backbone=False)
-
-            # Build second backbone+FPN on submesh 1
-            print("  Building second backbone+FPN on submesh 1...")
-            from model.resnet_bottleneck import create_tt_resnet_bottleneck
-            from model.fpn import FPN, _FPNParameters
-            import torchvision
-
-            ckpt = torch.load(os.path.abspath(args.ckpt), map_location="cpu", weights_only=False)
-            sd = ckpt["state_dict"]
-
-            resnet1 = torchvision.models.resnet50(weights=None)
-            resnet1_sd = {k.replace("img_backbone.", ""): v for k, v in sd.items() if k.startswith("img_backbone.")}
-            resnet1.load_state_dict(resnet1_sd, strict=False)
-            resnet1.eval()
-            backbone1, _ = create_tt_resnet_bottleneck(
-                torch_model=resnet1, device=submeshes[1], batch_size=3,
-                input_height=256, input_width=704,
-            )
-
-            lateral_params = []
-            fpn_params_list = []
-            for i in range(4):
-                lateral_params.append({
-                    "weight": ttnn.from_torch(sd[f"img_neck.lateral_convs.{i}.conv.weight"]),
-                    "bias": ttnn.from_torch(sd[f"img_neck.lateral_convs.{i}.conv.bias"].reshape(1, 1, 1, -1)),
-                })
-                fpn_params_list.append({
-                    "weight": ttnn.from_torch(sd[f"img_neck.fpn_convs.{i}.conv.weight"]),
-                    "bias": ttnn.from_torch(sd[f"img_neck.fpn_convs.{i}.conv.bias"].reshape(1, 1, 1, -1)),
-                })
-            fpn1 = FPN(
-                device=submeshes[1], parameters=_FPNParameters(lateral_params, fpn_params_list),
-                batch_size=3, in_channels=[256, 512, 1024, 2048], out_channels=256,
-                model_config={"WEIGHTS_DTYPE": ttnn.bfloat16, "ACTIVATIONS_DTYPE": ttnn.bfloat16, "MATH_FIDELITY": ttnn.MathFidelity.LoFi},
-                input_spatial_shapes=SPATIAL_SHAPES,
-            )
+        if args.dual_device and mesh_device is not None:
+            # Full mesh SPMD: backbone+FPN+Head all on mesh_device (bf16)
+            # backbone batch=3 per device (SPMD), Head replicated on mesh
+            model = load_model(args.ckpt, mesh_device, mesh_device=mesh_device, backbone_batch_size=3, fp32_backbone=False)
 
             model.mesh_parallel_mode = True
-            model._backbone_dev1 = backbone1
-            model._fpn_dev1 = fpn1
-            model._submesh0 = submeshes[0]
-            model._submesh1 = submeshes[1]
+            model._mesh_device = mesh_device
             model.serial_cams_per_batch = 0
-            print("  Mesh parallel mode: backbone batch=3 x 2 chips, HiFi4+fp32_acc")
+
+            print("  Full mesh SPMD mode: backbone+FPN+Head all on mesh_device (bf16)")
         elif args.dual_device:
             # Fallback: serial batch=3 x 2 on single device
             model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=3, fp32_backbone=False)
@@ -1214,6 +1175,8 @@ def main():
                             return None
                         if isinstance(t, torch.Tensor):
                             return t.cpu().float()
+                        if mesh_device is not None:
+                            return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0)).cpu().float()[:1]
                         return ttnn.to_torch(t).cpu().float()
 
                     entry = {
@@ -1231,12 +1194,17 @@ def main():
                     outputs,
                     info,
                     eval_config,
+                    mesh_device=mesh_device,
                 )
 
                 # Add sample_token to each detection
                 for d in dets:
                     d["sample_token"] = token
                 all_results[token] = dets
+
+                # Periodic GC to prevent host memory leak from to_torch/from_torch
+                if processed % 100 == 0:
+                    gc.collect()
 
                 if processed % 50 == 0 or processed == total_samples:
                     avg_time = total_time / processed

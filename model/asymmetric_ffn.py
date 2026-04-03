@@ -35,14 +35,16 @@ class AsymmetricFFN:
         in_channels: int = 512,
         embed_dims: int = 256,
         feedforward_channels: int = 1024,
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.in_channels = in_channels
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
-            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
-            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
 
         # pre_norm: LayerNorm(in_channels)
@@ -68,23 +70,26 @@ class AsymmetricFFN:
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def run(
         self,
@@ -102,53 +107,26 @@ class AsymmetricFFN:
         Returns:
             output: [bs, num_tokens, embed_dims] on device (TILE)
         """
-        # Flatten for linear ops: [1, 1, bs*num_tokens, in_channels]
         x_flat = ttnn.reshape(x, (1, 1, bs * num_tokens, self.in_channels))
+        normed = ttnn.layer_norm(x_flat, weight=self.pre_norm_weight, bias=self.pre_norm_bias,
+                                  epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
 
-        # --- 1. Pre-norm (LayerNorm) ---
-        normed = ttnn.layer_norm(
-            x_flat, weight=self.pre_norm_weight, bias=self.pre_norm_bias,
-            epsilon=1e-5,
-            compute_kernel_config=self._hifi_compute_config,
-        )
-
-        # --- 2. Identity path (use normed input, matching mmcv AsymmetricFFN) ---
-        # mmcv default: identity=None → identity = pre_norm(x), then identity_fc(identity)
         if self.has_identity_fc:
-            identity = ttnn.linear(
-                normed, self.identity_fc_weight, bias=self.identity_fc_bias,
-                compute_kernel_config=self._hifi_compute_config,
-            )
+            identity = ttnn.linear(normed, self.identity_fc_weight, bias=self.identity_fc_bias,
+                                    compute_kernel_config=self._hifi_compute_config)
         else:
             identity = normed
 
-        # --- 3. Linear(in_channels → feedforward_channels) + ReLU ---
         fc1_out = ttnn.linear(normed, self.fc1_weight, bias=self.fc1_bias, compute_kernel_config=self._hifi_compute_config)
-        # Only deallocate normed if identity doesn't alias it (asymmetric case)
         if self.has_identity_fc:
             ttnn.deallocate(normed)
-
         relu_out = ttnn.relu(fc1_out)
-
-        # --- 4. Linear(feedforward_channels → embed_dims) ---
         projected = ttnn.linear(relu_out, self.fc2_weight, bias=self.fc2_bias, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(fc1_out); ttnn.deallocate(relu_out)
 
-        # Sync + deallocate large intermediates (1024-dim tensors)
-        ttnn.synchronize_device(self.device)
-        ttnn.deallocate(fc1_out)
-        ttnn.deallocate(relu_out)
-
-        # --- 5. Residual ---
         output = ttnn.add(identity, projected)
-
-        # Sync + deallocate
-        ttnn.synchronize_device(self.device)
-        ttnn.deallocate(projected)
-        ttnn.deallocate(identity)
-
-        output = ttnn.reshape(output, (bs, num_tokens, self.embed_dims))
-
-        return output
+        ttnn.deallocate(projected); ttnn.deallocate(identity)
+        return ttnn.reshape(output, (bs, num_tokens, self.embed_dims))
 
 def preprocess_ffn_parameters(pt_ffn_layer) -> dict:
     """Extract parameters from mmcv AsymmetricFFN.
