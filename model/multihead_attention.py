@@ -44,14 +44,16 @@ class MultiheadAttention:
         parameters: dict,
         embed_dims: int = 512,
         num_heads: int = 8,
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.head_dim = embed_dims // num_heads
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
-            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
-            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
 
         # Q, K, V projection weights (already transposed: [in, out] for ttnn.linear)
@@ -67,28 +69,23 @@ class MultiheadAttention:
         self.b_out = self._to_device_bias(parameters["b_out"])
 
         # Precompute scale factor on device
-        self.scale = ttnn.from_torch(
-            torch.full((1, 1, 1, 1), self.head_dim**-0.5),
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            dtype=ttnn.float32,
-        )
+        self.scale = self._to_device_bias(torch.full((1,), self.head_dim**-0.5))
 
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device,
-            dtype=ttnn.float32,
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device,
-            dtype=ttnn.float32,
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def run(
         self,
@@ -130,73 +127,36 @@ class MultiheadAttention:
         q_flat = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
         logger.debug(f"MHA: Q linear start, q={q_flat.shape}")
         q = ttnn.linear(q_flat, self.w_q, bias=self.b_q, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-        logger.debug("MHA: Q linear done")
-
-        logger.debug("MHA: K reshape start")
         k_flat = ttnn.reshape(key, (1, 1, bs * num_keys, self.embed_dims))
-        logger.debug(f"MHA: K linear start, k={k_flat.shape}")
         k = ttnn.linear(k_flat, self.w_k, bias=self.b_k, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-        logger.debug("MHA: K linear done")
-
-        logger.debug("MHA: V reshape start")
         v_flat = ttnn.reshape(value, (1, 1, bs * num_keys, self.embed_dims))
-        logger.debug(f"MHA: V linear start, v={v_flat.shape}")
         v = ttnn.linear(v_flat, self.w_v, bias=self.b_v, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-        logger.debug("MHA: V linear done")
 
-        # --- 2. Multi-head reshape ---
-        logger.debug("MHA: multi-head reshape start")
+        # Multi-head reshape + permute
         q = ttnn.reshape(q, (bs, num_queries, self.num_heads, self.head_dim))
         q = ttnn.permute(q, (0, 2, 1, 3))
-
         k = ttnn.reshape(k, (bs, num_keys, self.num_heads, self.head_dim))
         k = ttnn.permute(k, (0, 2, 1, 3))
-
         v = ttnn.reshape(v, (bs, num_keys, self.num_heads, self.head_dim))
         v = ttnn.permute(v, (0, 2, 1, 3))
-        ttnn.synchronize_device(self.device)
-        logger.debug("MHA: multi-head reshape done")
 
-        # --- 3. Scaled dot-product attention ---
-        logger.debug(f"MHA: matmul q@k_t start, q={q.shape}, k={k.shape}")
+        # Scaled dot-product attention
         k_t = ttnn.transpose(k, -2, -1)
         attn_weights = ttnn.matmul(q, k_t, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-        ttnn.deallocate(q)
-        ttnn.deallocate(k)
-        ttnn.deallocate(k_t)
-        logger.debug("MHA: matmul q@k_t done")
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(k_t)
 
         attn_weights = ttnn.multiply(attn_weights, self.scale)
         attn_weights = ttnn.softmax(attn_weights, dim=-1, numeric_stable=True,
                                     compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-
-        logger.debug("MHA: softmax done")
 
         attn_output = ttnn.matmul(attn_weights, v, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
-        ttnn.deallocate(attn_weights)
-        ttnn.deallocate(v)
+        ttnn.deallocate(attn_weights); ttnn.deallocate(v)
 
-        logger.debug("MHA: matmul attn@v done")
-
-        # --- 4. Reshape back ---
+        # Reshape back + output projection
         attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
-        attn_output = ttnn.reshape(
-            attn_output, (1, 1, bs * num_queries, self.embed_dims)
-        )
-
-        # --- 5. Output projection ---
-        logger.debug("MHA: output projection start")
+        attn_output = ttnn.reshape(attn_output, (1, 1, bs * num_queries, self.embed_dims))
         output = ttnn.linear(attn_output, self.w_out, bias=self.b_out, compute_kernel_config=self._hifi_compute_config)
-        ttnn.synchronize_device(self.device)
         ttnn.deallocate(attn_output)
-
-        logger.debug("MHA: output projection done")
 
         # --- 6. Residual connection ---
         identity_flat = ttnn.reshape(

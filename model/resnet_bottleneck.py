@@ -91,8 +91,8 @@ def preprocess_resnet50_parameters(
     # Conv1 + BN1
     weight, bias = fold_bn_into_conv(model.conv1, model.bn1)
     parameters["conv1"] = {
-        "weight": ttnn.from_torch(weight, dtype=ttnn.float32),
-        "bias": ttnn.from_torch(bias.reshape(1, 1, 1, -1), dtype=ttnn.float32),
+        "weight": ttnn.from_torch(weight, dtype=ttnn.bfloat16),
+        "bias": ttnn.from_torch(bias.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16),
     }
 
     # Layers 1-4
@@ -109,8 +109,8 @@ def preprocess_resnet50_parameters(
                 bn = getattr(block, bn_name)
                 w, b = fold_bn_into_conv(conv, bn)
                 block_params[conv_name] = {
-                    "weight": ttnn.from_torch(w, dtype=ttnn.float32),
-                    "bias": ttnn.from_torch(b.reshape(1, 1, 1, -1), dtype=ttnn.float32),
+                    "weight": ttnn.from_torch(w, dtype=ttnn.bfloat16),
+                    "bias": ttnn.from_torch(b.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16),
                 }
 
             # Downsample path (if present)
@@ -119,8 +119,8 @@ def preprocess_resnet50_parameters(
                 ds_bn = block.downsample[1]
                 w, b = fold_bn_into_conv(ds_conv, ds_bn)
                 block_params["downsample"] = {
-                    "weight": ttnn.from_torch(w, dtype=ttnn.float32),
-                    "bias": ttnn.from_torch(b.reshape(1, 1, 1, -1), dtype=ttnn.float32),
+                    "weight": ttnn.from_torch(w, dtype=ttnn.bfloat16),
+                    "bias": ttnn.from_torch(b.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16),
                 }
 
             layer_params[block_idx] = block_params
@@ -203,7 +203,7 @@ class Conv2dOp:
         input_width: int,
         groups: int = 1,
         activation=None,
-        weights_dtype=ttnn.float32,
+        weights_dtype=ttnn.bfloat16,
         activation_dtype=ttnn.bfloat16,
         shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
         deallocate_activation: bool = False,
@@ -580,7 +580,7 @@ class TtResNetBottleneck:
             act_block_h_override=64,
             deallocate_activation=True,
             math_fidelity=ttnn.MathFidelity.HiFi4 if batch_size <= 3 else ttnn.MathFidelity.LoFi,
-            fp32_dest_acc_en=True,
+            fp32_dest_acc_en=True if batch_size <= 3 else False,
             math_approx_mode=False,
         )
         self.conv1.disable_slice()  # conv1 doesn't need L1 slicing
@@ -612,7 +612,7 @@ class TtResNetBottleneck:
             use_fp32_acc = (batch_size <= 3)
 
             # HiFi4 when fp32 acc is available, HiFi2 otherwise
-            fidelity = ttnn.MathFidelity.HiFi4 if use_fp32_acc else ttnn.MathFidelity.HiFi2
+            fidelity = ttnn.MathFidelity.HiFi4 if (batch_size <= 3) else ttnn.MathFidelity.HiFi2
 
             layer = ResLayer(
                 params=params[f"layer{i + 1}"],
@@ -627,7 +627,7 @@ class TtResNetBottleneck:
                 conv3_block_sharded=use_block_shard,
                 downsample_block_sharded=use_block_shard,
                 math_fidelity=fidelity,
-                fp32_dest_acc_en=use_fp32_acc,
+                fp32_dest_acc_en=True if (batch_size <= 3) else False,
             )
             self.res_layers.append(layer)
             inplanes = planes * Bottleneck.expansion

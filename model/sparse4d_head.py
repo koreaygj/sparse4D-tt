@@ -67,12 +67,14 @@ class Sparse4DHead:
         num_learnable_pts: int = 6,
         decouple_attn: bool = True,
         spatial_shapes: list = None,
+        mesh_device=None,
     ) -> None:
-        self.device = device
+        self.device = mesh_device if mesh_device is not None else device
+        self._mesh_device = mesh_device
         self.embed_dims = embed_dims
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
-            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4,
-            fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False,
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
         self.num_decoder = num_decoder
         self.num_single_frame_decoder = num_single_frame_decoder
@@ -88,11 +90,14 @@ class Sparse4DHead:
         self.layers = []
         for i, op in enumerate(operation_order):
             layer_params = parameters["layers"][i]
+            # In mesh SPMD mode, DFA uses num_cams=3 (each device processes 3 cameras)
+            dfa_num_cams = 3 if mesh_device is not None else num_cams
+
             if layer_params is None:
                 self.layers.append(None)
             elif op in ("gnn", "temp_gnn"):
                 self.layers.append(
-                    MultiheadAttention(device, layer_params, mha_embed, num_groups)
+                    MultiheadAttention(device, layer_params, mha_embed, num_groups, mesh_device=mesh_device)
                 )
             elif op == "norm":
                 self.layers.append({
@@ -108,11 +113,12 @@ class Sparse4DHead:
                         embed_dims=embed_dims,
                         num_groups=num_groups,
                         num_levels=num_levels,
-                        num_cams=num_cams,
+                        num_cams=dfa_num_cams,
                         num_pts=num_pts,
                         num_learnable_pts=num_learnable_pts,
                         use_camera_embed=True,
                         residual_mode="cat",
+                        mesh_device=mesh_device,
                     )
                 )
             elif op == "ffn":
@@ -122,6 +128,7 @@ class Sparse4DHead:
                         in_channels=embed_dims * 2,
                         embed_dims=embed_dims,
                         feedforward_channels=embed_dims * 4,
+                        mesh_device=mesh_device,
                     )
                 )
             elif op == "refine":
@@ -133,8 +140,16 @@ class Sparse4DHead:
                         num_cls=num_classes,
                         refine_yaw=True,
                         with_quality_estimation=True,
+                        mesh_device=mesh_device,
                     )
                 )
+
+        # --- DFA layer params for mesh DFA setup ---
+        self._mesh_dfa_runners = None
+        self._dfa_layer_params = {
+            i: parameters["layers"][i]
+            for i, op in enumerate(operation_order) if op == "deformable"
+        }
 
         # --- Anchor encoder ---
         self.anchor_encoder = SparseBox3DEncoder(
@@ -145,6 +160,7 @@ class Sparse4DHead:
             has_output_fc=not decouple_attn,
             in_loops=1,
             out_loops=4 if decouple_attn else 2,
+            mesh_device=mesh_device,
         )
 
         # --- Instance bank ---
@@ -155,6 +171,7 @@ class Sparse4DHead:
             num_anchor=num_anchor,
             embed_dims=embed_dims,
             num_temp_instances=num_temp_instances,
+            mesh_device=mesh_device,
         )
 
         # --- Decouple attention fc_before / fc_after ---
@@ -165,19 +182,36 @@ class Sparse4DHead:
             self.fc_before_weight = None
             self.fc_after_weight = None
 
+    def setup_mesh_dfa(self, dev1, mesh_device=None):
+        """Initialize MeshDFARunners for camera-parallel DFA on 2 submeshes."""
+        from model.mesh_dfa import MeshDFARunner
+        self._mesh_dfa_runners = {}
+        for i, op in enumerate(self.operation_order):
+            if op == "deformable" and i in self._dfa_layer_params:
+                self._mesh_dfa_runners[i] = MeshDFARunner(
+                    dfa0=self.layers[i],
+                    dev1=dev1,
+                    parameters=self._dfa_layer_params[i],
+                    model_config={},
+                    mesh_device=mesh_device,
+                )
+        logger.info(f"Mesh DFA: {len(self._mesh_dfa_runners)} runners on 2 submeshes")
+
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
             tensor = tensor.reshape(1, 1, 1, -1)
-        return ttnn.from_torch(
-            tensor.float(), layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32
-        )
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        if self._mesh_device is not None:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _graph_model(
         self,
@@ -191,40 +225,19 @@ class Sparse4DHead:
         num_queries: int,
         num_keys: int,
     ) -> ttnn.Tensor:
-        """Run MHA with decouple_attn wrapping.
-
-        decouple_attn=True flow:
-          query = cat([query, query_pos])      → [bs, N, 512]
-          key   = cat([key, key_pos]) or query
-          value = fc_before(value)             → [bs, M, 512]
-          out   = MHA(query, key, value)       → [bs, N, 512]
-          out   = fc_after(out)                → [bs, N, 256]
-        """
-        logger.debug(f"_graph_model[{layer_idx}]: start, decouple={self.decouple_attn}, "
-                     f"q={query.shape}, key={'None' if key is None else key.shape}, "
-                     f"value={'None' if value is None else value.shape}, num_queries={num_queries}, num_keys={num_keys}")
-
+        """Run MHA with decouple_attn wrapping (on device)."""
         if self.decouple_attn:
-            query = ttnn.concat([query, query_pos], dim=-1)  # [bs, N, 512]
+            query = ttnn.concat([query, query_pos], dim=-1)
             if key is not None and key_pos is not None:
                 key = ttnn.concat([key, key_pos], dim=-1)
             else:
                 key = query
                 num_keys = num_queries
-            ttnn.synchronize_device(self.device)
-            logger.debug(f"_graph_model[{layer_idx}]: concat done, num_keys={num_keys}")
-
-            # fc_before(value) — skip if value is None (self-attention uses query as value)
             if value is not None:
                 n_val = bs * num_keys
                 val_flat = ttnn.reshape(value, (1, 1, n_val, self.embed_dims))
-                logger.debug(f"_graph_model[{layer_idx}]: fc_before start, val_flat={val_flat.shape}")
                 value = ttnn.linear(val_flat, self.fc_before_weight)
                 value = ttnn.reshape(value, (bs, num_keys, self.embed_dims * 2))
-                ttnn.synchronize_device(self.device)
-                logger.debug(f"_graph_model[{layer_idx}]: fc_before done, value={value.shape}")
-            else:
-                logger.debug(f"_graph_model[{layer_idx}]: value=None, skip fc_before")
         else:
             if query_pos is not None:
                 query = ttnn.add(query, query_pos)
@@ -237,36 +250,22 @@ class Sparse4DHead:
                 value = key
 
         mha = self.layers[layer_idx]
-        logger.debug(f"_graph_model[{layer_idx}]: MHA.run start")
-        out = mha.run(
-            query=query, key=key, value=value,
-            bs=bs, num_queries=num_queries, num_keys=num_keys,
-        )
-        ttnn.synchronize_device(self.device)
-        logger.debug(f"_graph_model[{layer_idx}]: MHA.run done")
+        out = mha.run(query=query, key=key, value=value, bs=bs, num_queries=num_queries, num_keys=num_keys)
 
         if self.decouple_attn:
             n_q = bs * num_queries
             out_flat = ttnn.reshape(out, (1, 1, n_q, self.embed_dims * 2))
-            logger.debug(f"_graph_model[{layer_idx}]: fc_after start")
             out = ttnn.linear(out_flat, self.fc_after_weight)
             out = ttnn.reshape(out, (bs, num_queries, self.embed_dims))
-            ttnn.synchronize_device(self.device)
-            logger.debug(f"_graph_model[{layer_idx}]: fc_after done")
 
         return out
 
     def _norm(self, layer_idx: int, x: ttnn.Tensor, bs: int, num_tokens: int):
-        """LayerNorm."""
+        """LayerNorm on device."""
         norm = self.layers[layer_idx]
         x_flat = ttnn.reshape(x, (1, 1, bs * num_tokens, self.embed_dims))
-        normed = ttnn.layer_norm(
-            x_flat, weight=norm["weight"], bias=norm["bias"],
-            epsilon=1e-5,
-            compute_kernel_config=self._hifi_compute_config,
-        )
-        ttnn.synchronize_device(self.device)
-        # x_flat is reshape view, don't deallocate
+        normed = ttnn.layer_norm(x_flat, weight=norm["weight"], bias=norm["bias"],
+                                  epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
         return ttnn.reshape(normed, (bs, num_tokens, self.embed_dims))
 
     def forward(
@@ -289,6 +288,8 @@ class Sparse4DHead:
         """
         num_anchor = self.num_anchor
         debug_intermediates = {}
+
+        # (Legacy mesh DFA cache clearing removed - using native mesh SPMD now)
 
         # 1. InstanceBank.get()
         (
@@ -316,14 +317,27 @@ class Sparse4DHead:
             num_temp = 0
 
         # 3. Pre-allocate projection_mat and image_wh on device (reused across decoder loop)
-        proj_tt = ttnn.from_torch(
-            metas["projection_mat"].float(),
-            layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
-        )
-        wh_tt = ttnn.from_torch(
-            metas["image_wh"].float(),
-            layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
-        )
+        proj_pt = metas["projection_mat"].float()
+        wh_pt = metas["image_wh"].float()
+        if self._mesh_device is not None:
+            # Shard full proj/wh by camera dim: [1,6,4,4] → each device gets [1,3,4,4]
+            proj_tt = ttnn.from_torch(
+                proj_pt,
+                layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
+            )
+            wh_tt = ttnn.from_torch(
+                wh_pt,
+                layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
+            )
+        else:
+            proj_tt = ttnn.from_torch(
+                proj_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+            )
+            wh_tt = ttnn.from_torch(
+                wh_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+            )
 
         # 4. Decoder loop
         prediction = []
@@ -333,7 +347,6 @@ class Sparse4DHead:
         for i, op in enumerate(self.operation_order):
             logger.debug(f"Head decoder: op[{i}]={op} start, inst_feat dtype={instance_feature.dtype}")
             logger.debug(f"Head decoder: op[{i}]={op} sync start")
-            ttnn.synchronize_device(self.device)
             logger.debug(f"Head decoder: op[{i}]={op} sync done")
 
             if self.layers[i] is None:
@@ -408,7 +421,6 @@ class Sparse4DHead:
                     instance_feature, anchor, anchor_embed, time_interval,
                     bs=bs, num_anchor=num_anchor, return_cls=return_cls,
                 )
-                ttnn.synchronize_device(self.device)
                 logger.debug(f"Head refine[{i}]: refine.run done")
                 prediction.append(anchor)
                 classification.append(cls)
@@ -434,7 +446,6 @@ class Sparse4DHead:
                     anchor_embed = self.anchor_encoder.run(
                         anchor, bs=bs, num_anchor=num_anchor
                     )
-                    ttnn.synchronize_device(self.device)
                     ttnn.deallocate(old_anchor_embed)
                     logger.debug(f"Head refine[{i}]: anchor_encoder.run done, anchor_embed={anchor_embed.shape}")
 
