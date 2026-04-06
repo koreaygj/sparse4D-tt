@@ -248,6 +248,8 @@ class DeformableFeatureAggregation:
     ) -> ttnn.Tensor:
         """Project 3D key points to normalized 2D per camera on device.
 
+        Uses batched matmul across all cameras (no per-camera loop).
+
         Args:
             key_points: [bs, num_anchor*num_pts, 3] on device
             projection_mat: [bs, num_cams, 4, 4] on device
@@ -257,9 +259,9 @@ class DeformableFeatureAggregation:
             points_2d_grid: [bs*num_cams, num_anchor, num_pts, 2] on device
         """
         n_pts_total = num_anchor * self.num_pts
+        nc = self.num_cams
 
         # Append ones for homogeneous: [bs, n_pts_total, 4]
-        # Use float32 for projection (grid_sample requires float32 grid)
         _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
         if self._mesh_device is not None:
             _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
@@ -267,80 +269,47 @@ class DeformableFeatureAggregation:
             key_points = ttnn.typecast(key_points, ttnn.float32)
         ones = ttnn.from_torch(torch.ones(bs, n_pts_total, 1), **_kw_f32)
         pts_homo = ttnn.concat([key_points, ones], dim=-1)  # [bs, n_pts_total, 4]
+        logger.debug(f"DFA _project_points: pts_homo shape={pts_homo.shape}")
 
-        # Per-camera projection via loop (avoid 6D tensor)
-        all_cam_points = []
-        for cam_idx in range(self.num_cams):
-            logger.debug(f"DFA _project_points: cam {cam_idx}/{self.num_cams} start")
-            proj = ttnn.slice(
-                projection_mat,
-                [0, cam_idx, 0, 0],
-                [bs, cam_idx + 1, 4, 4],
-            )
-            proj = ttnn.reshape(proj, (bs, 4, 4))
-
-            proj_t = ttnn.transpose(proj, -2, -1)
-            projected = ttnn.matmul(pts_homo, proj_t, compute_kernel_config=self._hifi_compute_config)
-            ttnn.deallocate(proj)
-            ttnn.deallocate(proj_t)
-            logger.debug(f"DFA _project_points: cam {cam_idx} matmul done")
-
-            xy = ttnn.slice(projected, [0, 0, 0], [bs, n_pts_total, 2])
-            z = ttnn.slice(projected, [0, 0, 2], [bs, n_pts_total, 3])
-            z_clamped = ttnn.clamp(z, min=1e-5)
-            z_recip = ttnn.reciprocal(z_clamped)
-            xy_div = ttnn.multiply(xy, z_recip)
-            ttnn.deallocate(projected)
-            ttnn.deallocate(xy)
-            ttnn.deallocate(z)
-            ttnn.deallocate(z_clamped)
-            ttnn.deallocate(z_recip)
-            logger.debug(f"DFA _project_points: cam {cam_idx} perspective divide done")
-
-            wh = ttnn.slice(image_wh, [0, cam_idx, 0], [bs, cam_idx + 1, 2])
-            wh = ttnn.reshape(wh, (bs, 1, 2))
-            wh_recip = ttnn.reciprocal(wh)
-            ttnn.deallocate(wh)
-            xy_norm = ttnn.multiply(xy_div, wh_recip)
-
-            xy_scaled = ttnn.multiply(xy_norm, self._scalar_two)
-            xy_grid = ttnn.subtract(xy_scaled, self._scalar_one)
-            ttnn.deallocate(xy_div)
-            ttnn.deallocate(wh_recip)
-            ttnn.deallocate(xy_norm)
-            ttnn.deallocate(xy_scaled)
-            logger.debug(f"DFA _project_points: cam {cam_idx} grid done")
-
-            xy_grid = ttnn.reshape(xy_grid, (bs, num_anchor, self.num_pts, 2))
-            all_cam_points.append(xy_grid)
-
-        # Interleave camera results to match PyTorch order:
-        # PyTorch: [b0_c0, b0_c1, ..., b0_c5, b1_c0, ...] (batch varies slowest)
-        # Each cam result: [bs, num_anchor, num_pts, 2]
-        if bs == 1:
-            # Simple case: just concat cameras along dim=0
-            points_2d = ttnn.concat(all_cam_points, dim=0)
-        else:
-            # For bs>1: need to interleave batch and camera dims
-            # Slice per-batch from each camera, then concat in correct order
-            interleaved = []
-            for b in range(bs):
-                for cam_idx in range(self.num_cams):
-                    cam_data = all_cam_points[cam_idx]
-                    b_slice = ttnn.slice(
-                        cam_data,
-                        [b, 0, 0, 0],
-                        [b + 1, num_anchor, self.num_pts, 2],
-                    )
-                    interleaved.append(b_slice)
-            points_2d = ttnn.concat(interleaved, dim=0)
-            for s in interleaved:
-                ttnn.deallocate(s)
-
+        # Batched projection: all cameras in one matmul
+        # Expand pts_homo: [bs, n_pts, 4] → [bs*nc, n_pts, 4]
+        pts_expanded = ttnn.concat([pts_homo] * nc, dim=0)  # [bs*nc, n_pts, 4]
         ttnn.deallocate(pts_homo)
         ttnn.deallocate(ones)
-        for p in all_cam_points:
-            ttnn.deallocate(p)
+
+        # Reshape proj: [bs, nc, 4, 4] → [bs*nc, 4, 4] → transpose → [bs*nc, 4, 4]
+        proj = ttnn.reshape(projection_mat, (bs * nc, 4, 4))
+        proj_t = ttnn.transpose(proj, -2, -1)
+
+        # Batched matmul: [bs*nc, n_pts, 4] × [bs*nc, 4, 4] → [bs*nc, n_pts, 4]
+        projected = ttnn.matmul(pts_expanded, proj_t, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(pts_expanded)
+        logger.debug("DFA _project_points: batched matmul done")
+
+        # Perspective divide (all cameras at once)
+        xy = ttnn.slice(projected, [0, 0, 0], [bs * nc, n_pts_total, 2])
+        z = ttnn.slice(projected, [0, 0, 2], [bs * nc, n_pts_total, 3])
+        ttnn.deallocate(projected)
+        z_clamped = ttnn.clamp(z, min=1e-5)
+        z_recip = ttnn.reciprocal(z_clamped)
+        xy_div = ttnn.multiply(xy, z_recip)
+        ttnn.deallocate(xy); ttnn.deallocate(z); ttnn.deallocate(z_clamped); ttnn.deallocate(z_recip)
+        logger.debug("DFA _project_points: perspective divide done")
+
+        # Grid normalization (all cameras at once)
+        # image_wh: [bs, nc, 2] → [bs*nc, 1, 2]
+        wh = ttnn.reshape(image_wh, (bs * nc, 1, 2))
+        wh_recip = ttnn.reciprocal(wh)
+        xy_norm = ttnn.multiply(xy_div, wh_recip)
+        ttnn.deallocate(xy_div); ttnn.deallocate(wh_recip)
+
+        xy_scaled = ttnn.multiply(xy_norm, self._scalar_two)
+        xy_grid = ttnn.subtract(xy_scaled, self._scalar_one)
+        ttnn.deallocate(xy_norm); ttnn.deallocate(xy_scaled)
+        logger.debug("DFA _project_points: grid normalization done")
+
+        # Reshape to [bs*nc, num_anchor, num_pts, 2]
+        points_2d = ttnn.reshape(xy_grid, (bs * nc, num_anchor, self.num_pts, 2))
 
         return points_2d
 
