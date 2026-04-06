@@ -208,42 +208,33 @@ class DeformableFeatureAggregation:
         ttnn.deallocate(learnable_kps)
         logger.debug("_kps_generator: concat done")
 
-        # --- Host fallback for rotation + translation (small tensors, avoids TILE hang) ---
-        if self._mesh_device is not None:
-            _composer = ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)
-            key_points_torch = ttnn.to_torch(key_points, mesh_composer=_composer)[:bs * num_anchor]
-            ttnn.deallocate(key_points)
-            anchor_torch = ttnn.to_torch(anchor, mesh_composer=_composer)[:bs]
-        else:
-            key_points_torch = ttnn.to_torch(key_points)  # [bs*num_anchor, 13, 3]
-            ttnn.deallocate(key_points)
-            anchor_torch = ttnn.to_torch(anchor)  # [bs, num_anchor, 11]
+        # --- Rotation + translation on device ---
+        n = bs * num_anchor
+        anchor_flat = ttnn.reshape(anchor, (n, 1, 11))
 
-        cos_yaw = anchor_torch[:, :, COS_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
-        sin_yaw = anchor_torch[:, :, SIN_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
+        cos_yaw = ttnn.slice(anchor_flat, [0, 0, COS_YAW], [n, 1, COS_YAW + 1])  # [n, 1, 1]
+        sin_yaw = ttnn.slice(anchor_flat, [0, 0, SIN_YAW], [n, 1, SIN_YAW + 1])  # [n, 1, 1]
 
-        kp_x = key_points_torch[:, :, 0]  # [900, 13]
-        kp_y = key_points_torch[:, :, 1]  # [900, 13]
-        kp_z = key_points_torch[:, :, 2]  # [900, 13]
+        kp_x = ttnn.slice(key_points, [0, 0, 0], [n, self.num_pts, 1])  # [n, 13, 1]
+        kp_y = ttnn.slice(key_points, [0, 0, 1], [n, self.num_pts, 2])  # [n, 13, 1]
+        kp_z = ttnn.slice(key_points, [0, 0, 2], [n, self.num_pts, 3])  # [n, 13, 1]
+        ttnn.deallocate(key_points)
 
-        rot_x = cos_yaw * kp_x - sin_yaw * kp_y
-        rot_y = sin_yaw * kp_x + cos_yaw * kp_y
+        rot_x = ttnn.subtract(ttnn.multiply(cos_yaw, kp_x), ttnn.multiply(sin_yaw, kp_y))
+        rot_y = ttnn.add(ttnn.multiply(sin_yaw, kp_x), ttnn.multiply(cos_yaw, kp_y))
+        ttnn.deallocate(kp_x); ttnn.deallocate(kp_y)
 
-        key_points_torch = torch.stack([rot_x, rot_y, kp_z], dim=-1)  # [900, 13, 3]
+        key_points = ttnn.concat([rot_x, rot_y, kp_z], dim=-1)  # [n, 13, 3]
+        ttnn.deallocate(rot_x); ttnn.deallocate(rot_y); ttnn.deallocate(kp_z)
+        ttnn.deallocate(anchor_flat)
 
-        # Translate to anchor center
-        center = anchor_torch[:, :, X:Z + 1].reshape(bs * num_anchor, 1, 3)  # [900, 1, 3]
-        key_points_torch = key_points_torch + center
+        center = ttnn.reshape(anchor, (n, 1, 11))
+        center = ttnn.slice(center, [0, 0, X], [n, 1, Z + 1])  # [n, 1, 3]
+        key_points = ttnn.add(key_points, center)
+        ttnn.deallocate(center)
 
-        # Reshape to [bs, num_anchor*num_pts, 3] and send back to device
-        key_points_torch = key_points_torch.reshape(bs, num_anchor * self.num_pts, 3)
-        # Use float32 for key_points (feeds into projection → grid_sample)
-        _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        if self._mesh_device is not None:
-            _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        key_points = ttnn.from_torch(key_points_torch.float(), **_kw_f32)
-        del key_points_torch, anchor_torch
-        logger.debug("_kps_generator: rotation+translate (host) done")
+        key_points = ttnn.reshape(key_points, (bs, n * self.num_pts // bs, 3))
+        logger.debug("_kps_generator: rotation+translate (device) done")
 
         return key_points
 
@@ -272,6 +263,8 @@ class DeformableFeatureAggregation:
         _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
         if self._mesh_device is not None:
             _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        if key_points.dtype != ttnn.float32:
+            key_points = ttnn.typecast(key_points, ttnn.float32)
         ones = ttnn.from_torch(torch.ones(bs, n_pts_total, 1), **_kw_f32)
         pts_homo = ttnn.concat([key_points, ones], dim=-1)  # [bs, n_pts_total, 4]
 
@@ -730,6 +723,8 @@ class DeformableFeatureAggregation:
         inst_flat = ttnn.reshape(
             instance_feature, (1, 1, bs * num_anchor, self.embed_dims)
         )
+        if output.dtype != inst_flat.dtype:
+            output = ttnn.typecast(output, inst_flat.dtype)
         if self.residual_mode == "add":
             output = ttnn.add(output, inst_flat)
             output = ttnn.reshape(output, (bs, num_anchor, self.embed_dims))
