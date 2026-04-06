@@ -135,6 +135,7 @@ class InstanceBank:
             )
 
             cached_anchor = self._to_dev(cached_anchor_pt)
+            self.cached_anchor = cached_anchor  # update for update() to use projected version
             cached_feature = self.cached_feature  # already on device
         else:
             self.reset()

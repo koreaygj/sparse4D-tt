@@ -388,7 +388,7 @@ def _build_head_from_sd(sd, device, mesh_device=None):
     return head
 
 
-def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp32_backbone=False):
+def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp32_backbone=False, fidelity_override=None):
     """Load full TT-NN Sparse4D model from checkpoint.
 
     Args:
@@ -397,6 +397,7 @@ def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp
         mesh_device: deprecated, ignored
         backbone_batch_size: override batch size for backbone/FPN (default: 6)
         fp32_backbone: use float32 for backbone/FPN activations
+        fidelity_override: "lofi", "hifi2", or "hifi4" to override all modules
     """
     print(f"  Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -412,6 +413,45 @@ def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp
 
     print("  Building Sparse4DHead...")
     head = _build_head_from_sd(sd, device, mesh_device=mesh_device)
+
+    # Override math fidelity for all head modules
+    if fidelity_override:
+        fidelity_map = {
+            "lofi": ttnn.MathFidelity.LoFi,
+            "hifi2": ttnn.MathFidelity.HiFi2,
+            "hifi4": ttnn.MathFidelity.HiFi4,
+        }
+        fidelity = fidelity_map[fidelity_override]
+        fp32_acc = (fidelity_override == "hifi4")
+        new_config = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=fidelity,
+            fp32_dest_acc_en=fp32_acc, packer_l1_acc=fp32_acc, math_approx_mode=False,
+        )
+        # Apply to all head sub-modules
+        head._hifi_compute_config = new_config
+        for layer in head.layers:
+            if layer is not None and hasattr(layer, '_hifi_compute_config'):
+                layer._hifi_compute_config = new_config
+        # Apply to FPN
+        fpn.compute_kernel_config = new_config
+        # Apply to backbone conv2d ops
+        from model.resnet_bottleneck import Conv2dOp
+        def _override_backbone(module):
+            if isinstance(module, Conv2dOp):
+                module.compute_config = new_config
+            elif hasattr(module, 'res_layers'):
+                for layer in module.res_layers:
+                    _override_backbone(layer)
+            elif hasattr(module, 'blocks'):
+                for block in module.blocks:
+                    _override_backbone(block)
+            for attr in ['conv1', 'conv2', 'conv3', 'downsample_conv']:
+                if hasattr(module, attr):
+                    obj = getattr(module, attr)
+                    if isinstance(obj, Conv2dOp):
+                        obj.compute_config = new_config
+        _override_backbone(backbone)
+        print(f"  Fidelity override: {fidelity_override} (fp32_acc={fp32_acc}) applied to Backbone + FPN + Head")
 
     model = Sparse4DInference(device, backbone, fpn, head)
     print("  Model build complete.")
@@ -1072,7 +1112,30 @@ def main():
         action="store_true",
         help="Use 2 devices (batch=3 each) for backbone+FPN with HiFi4+fp32_acc precision",
     )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Use BF16 QAT finetuned checkpoint (ckpt/bf16_latest.pth)",
+    )
+    parser.add_argument(
+        "--bf8",
+        action="store_true",
+        help="Use BF8 QAT finetuned checkpoint (ckpt/bf8_latest.pth)",
+    )
+    parser.add_argument(
+        "--fidelity",
+        type=str,
+        choices=["lofi", "hifi2", "hifi4"],
+        default=None,
+        help="Override math fidelity for all head modules (default: per-module setting)",
+    )
     args = parser.parse_args()
+
+    # Override checkpoint path for QAT models
+    if args.bf16:
+        args.ckpt = "ckpt/bf16_latest.pth"
+    elif args.bf8:
+        args.ckpt = "ckpt/bf8_latest.pth"
 
     # Set log level: DEBUG only when --debug is passed
     from loguru import logger
@@ -1118,7 +1181,7 @@ def main():
         if args.dual_device and mesh_device is not None:
             # Full mesh SPMD: backbone+FPN+Head all on mesh_device (bf16)
             # backbone batch=3 per device (SPMD), Head replicated on mesh
-            model = load_model(args.ckpt, mesh_device, mesh_device=mesh_device, backbone_batch_size=3, fp32_backbone=False)
+            model = load_model(args.ckpt, mesh_device, mesh_device=mesh_device, backbone_batch_size=3, fp32_backbone=False, fidelity_override=args.fidelity)
 
             model.mesh_parallel_mode = True
             model._mesh_device = mesh_device
@@ -1127,12 +1190,12 @@ def main():
             print("  Full mesh SPMD mode: backbone+FPN+Head all on mesh_device (bf16)")
         elif args.dual_device:
             # Fallback: serial batch=3 x 2 on single device
-            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=3, fp32_backbone=False)
+            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=3, fp32_backbone=False, fidelity_override=args.fidelity)
             model.serial_cams_per_batch = 3
             print("  HiFi4+fp32_acc mode: serial batch=3 x 2 runs (single device)")
         else:
             # Single device mode: batch=6, all on-device
-            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=6, fp32_backbone=False)
+            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=6, fp32_backbone=False, fidelity_override=args.fidelity)
             model.serial_cams_per_batch = 0
             print("  Direct batch mode: 6 cameras, no serial (all on-device)")
 
