@@ -79,6 +79,22 @@ python run_inference_video.py --dual-device --mode fps --frames 50
 
 ## Compare with PyTorch
 
+### matrics
+
+|           | **PyTorch (CUDA)** | **TT-NN (N300)** | **Gap** |
+| --------- | ------------------ | ---------------- | ------- |
+| **mAP**   | 0.4529             | 0.3975           | -0.055  |
+| **NDS**   | 0.5602             | 0.5179           | -0.042  |
+| mATE      | 0.5455             | 0.6196           | +0.074  |
+| mASE      | 0.2622             | 0.2693           | +0.007  |
+| mAOE      | 0.4373             | 0.4777           | +0.040  |
+| mAVE      | 0.2195             | 0.2658           | +0.046  |
+| mAAE      | 0.1987             | 0.1765           | -0.022  |
+| **Speed** | ~120ms (A100)      | **330ms**        | -       |
+
+
+### Inference video
+
 https://github.com/user-attachments/assets/3752d051-9e4a-4a9d-9410-eec0bdcb3027
 
 ## References
