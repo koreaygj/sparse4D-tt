@@ -175,40 +175,43 @@ class InstanceBank:
 
         N = self.num_anchor - self.num_temp_instances  # 300
 
-        # confidence max over classes: [bs, num_anchor, num_cls] → [bs, num_anchor]
+        # Host topk (accurate tie-breaking) + device gather
         conf_pt = self._from_dev(confidence)
-        conf_max = conf_pt.max(dim=-1).values  # [bs, num_anchor]
-
-        # topk: select top-N by confidence
+        conf_max = conf_pt.max(dim=-1).values
         _, top_indices = torch.topk(conf_max, N, dim=1)  # [bs, N]
 
-        # Gather selected features and anchors on host
-        inst_pt = self._from_dev(instance_feature)
-        anch_pt = self._from_dev(anchor)
+        # Upload indices to device, expand via repeat_interleave
+        _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.uint32)
+        if self._mesh_device is not None:
+            _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        top_idx = ttnn.from_torch(top_indices.int().unsqueeze(-1), **_kw)  # [bs, N, 1]
 
-        selected_feature = torch.gather(
-            inst_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, self.embed_dims),
-        )
-        selected_anchor = torch.gather(
-            anch_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, anch_pt.shape[-1]),
-        )
+        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+        selected_feature = ttnn.gather(instance_feature, 1, idx_feat)
+        ttnn.deallocate(idx_feat)
 
-        # Concat cached + selected
-        cached_feat_pt = self._from_dev(self.cached_feature)
-        cached_anch_pt = self._from_dev(self.cached_anchor)
-        merged_feature = torch.cat([cached_feat_pt, selected_feature], dim=1)
-        merged_anchor = torch.cat([cached_anch_pt, selected_anchor], dim=1)
+        anch_dim = anchor.shape[-1]
+        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+        selected_anchor = ttnn.gather(anchor, 1, idx_anch)
+        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
-        # Apply mask: use merged where mask=True, keep original where mask=False
-        mask = self.mask[:, None, None]  # [bs, 1, 1]
-        out_feature = torch.where(mask, merged_feature, inst_pt)
-        out_anchor = torch.where(mask, merged_anchor, anch_pt)
+        # Device concat
+        merged_feature = ttnn.concat([self.cached_feature, selected_feature], dim=1)
+        merged_anchor = ttnn.concat([self.cached_anchor, selected_anchor], dim=1)
+        ttnn.deallocate(selected_feature); ttnn.deallocate(selected_anchor)
 
-        # Back to device
-        instance_feature = self._to_dev(out_feature)
-        anchor = self._to_dev(out_anchor)
+        if self.mask.all():
+            instance_feature = merged_feature
+            anchor = merged_anchor
+        else:
+            inst_pt = self._from_dev(instance_feature)
+            anch_pt = self._from_dev(anchor)
+            merged_f_pt = self._from_dev(merged_feature)
+            merged_a_pt = self._from_dev(merged_anchor)
+            mask_t = self.mask[:, None, None]
+            instance_feature = self._to_dev(torch.where(mask_t, merged_f_pt, inst_pt))
+            anchor = self._to_dev(torch.where(mask_t, merged_a_pt, anch_pt))
+            ttnn.deallocate(merged_feature); ttnn.deallocate(merged_anchor)
 
         return instance_feature, anchor
 
@@ -248,26 +251,25 @@ class InstanceBank:
                 decayed, conf_scores[:, :self.num_temp_instances]
             )
 
-        # topk: select top num_temp_instances
-        top_conf, top_indices = torch.topk(
-            conf_scores, self.num_temp_instances, dim=1
-        )
+        # Host topk + device gather (repeat_interleave fixed for uint32)
+        K = self.num_temp_instances
+        top_conf, top_indices = torch.topk(conf_scores, K, dim=1)
 
-        inst_pt = self._from_dev(instance_feature)
-        anch_pt = self._from_dev(anchor)
+        _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.uint32)
+        if self._mesh_device is not None:
+            _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        top_idx = ttnn.from_torch(top_indices.int().unsqueeze(-1), **_kw)
 
-        cached_feature = torch.gather(
-            inst_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, self.embed_dims),
-        )
-        cached_anchor = torch.gather(
-            anch_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, anch_pt.shape[-1]),
-        )
+        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+        self.cached_feature = ttnn.gather(instance_feature, 1, idx_feat)
+        ttnn.deallocate(idx_feat)
 
-        self.cached_feature = self._to_dev(cached_feature)
-        self.cached_anchor = self._to_dev(cached_anchor)
-        self.confidence = self._to_dev(top_conf.reshape(1, 1, bs, self.num_temp_instances))
+        anch_dim = anchor.shape[-1]
+        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+        self.cached_anchor = ttnn.gather(anchor, 1, idx_anch)
+        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
+
+        self.confidence = self._to_dev(top_conf.reshape(1, 1, bs, K))
 
     @staticmethod
     def _anchor_projection(
