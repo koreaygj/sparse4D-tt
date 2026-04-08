@@ -289,7 +289,12 @@ class Sparse4DHead:
         num_anchor = self.num_anchor
         debug_intermediates = {}
 
-        # (Legacy mesh DFA cache clearing removed - using native mesh SPMD now)
+        # Clear per-frame DFA caches
+        for i, op in enumerate(self.operation_order):
+            if op == "deformable" and self.layers[i] is not None:
+                self.layers[i]._cached_camera_embed = None
+                self.layers[i]._host_proj = None
+                self.layers[i]._host_wh = None
 
         # 1. InstanceBank.get()
         (
@@ -316,28 +321,33 @@ class Sparse4DHead:
             temp_anchor_embed = None
             num_temp = 0
 
-        # 3. Pre-allocate projection_mat and image_wh on device (reused across decoder loop)
+        # 3. Pre-allocate projection_mat and image_wh on device
         proj_pt = metas["projection_mat"].float()
-        wh_pt = metas["image_wh"].float()
         if self._mesh_device is not None:
-            # Shard full proj/wh by camera dim: [1,6,4,4] → each device gets [1,3,4,4]
             proj_tt = ttnn.from_torch(
                 proj_pt,
                 layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
                 mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
             )
-            wh_tt = ttnn.from_torch(
-                wh_pt,
-                layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
-                mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
-            )
+            # image_wh is constant across frames — cache on device
+            if not hasattr(self, '_cached_wh_tt') or self._cached_wh_tt is None:
+                wh_pt = metas["image_wh"].float()
+                self._cached_wh_tt = ttnn.from_torch(
+                    wh_pt,
+                    layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                    mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
+                )
+            wh_tt = self._cached_wh_tt
         else:
             proj_tt = ttnn.from_torch(
                 proj_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
             )
-            wh_tt = ttnn.from_torch(
-                wh_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
-            )
+            if not hasattr(self, '_cached_wh_tt') or self._cached_wh_tt is None:
+                wh_pt = metas["image_wh"].float()
+                self._cached_wh_tt = ttnn.from_torch(
+                    wh_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                )
+            wh_tt = self._cached_wh_tt
 
         # 4. Decoder loop
         prediction = []
@@ -468,7 +478,7 @@ class Sparse4DHead:
 
         # 5. Deallocate projection_mat and image_wh
         ttnn.deallocate(proj_tt)
-        ttnn.deallocate(wh_tt)
+        # wh_tt is cached, don't deallocate
 
         # 6. Cache for next frame
         last_cls = classification[-1]
