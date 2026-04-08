@@ -200,28 +200,17 @@ class SparseBox3DEncoder:
         Returns:
             output: [bs, num_anchor, output_dims] on device (TILE)
         """
-        # Extract components via host slice (avoid ttnn.slice hang on submesh)
+        # Extract components via device slice (no host roundtrip)
         logger.debug(f"Encoder.run: slice start, box_3d={box_3d.shape}, bs={bs}, num_anchor={num_anchor}")
-        if self._mesh_device is not None:
-            box_pt = ttnn.to_torch(box_3d, mesh_composer=ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)).float()[:bs]
-        else:
-            box_pt = ttnn.to_torch(box_3d).float()
         n = bs * num_anchor
 
-        # Host compute path: run Linear→ReLU→LN chains on CPU for higher precision
-        if self._use_host_compute:
-            return self._run_host(box_pt, bs, num_anchor, n)
+        pos = ttnn.slice(box_3d, [0, 0, X], [bs, num_anchor, Z + 1])        # [bs, 900, 3]
+        size = ttnn.slice(box_3d, [0, 0, W], [bs, num_anchor, H + 1])       # [bs, 900, 3]
+        yaw = ttnn.slice(box_3d, [0, 0, SIN_YAW], [bs, num_anchor, COS_YAW + 1])  # [bs, 900, 2]
 
-        pos_pt = box_pt[:, :, X:Z+1].contiguous().reshape(1, 1, n, 3)
-        size_pt = box_pt[:, :, W:H+1].contiguous().reshape(1, 1, n, 3)
-        yaw_pt = box_pt[:, :, SIN_YAW:COS_YAW+1].contiguous().reshape(1, 1, n, 2)
-
-        _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
-        if self._mesh_device is not None:
-            _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        pos = ttnn.from_torch(pos_pt, **_kw)
-        size = ttnn.from_torch(size_pt, **_kw)
-        yaw = ttnn.from_torch(yaw_pt, **_kw)
+        pos = ttnn.reshape(pos, (1, 1, n, 3))
+        size = ttnn.reshape(size, (1, 1, n, 3))
+        yaw = ttnn.reshape(yaw, (1, 1, n, 2))
         logger.debug("Encoder.run: slice done")
 
         logger.debug("Encoder.run: pos_layers start")
@@ -249,11 +238,8 @@ class SparseBox3DEncoder:
         logger.debug(f"Encoder.run: combine done, mode={self.mode}")
 
         if self.vel_dims > 0:
-            vel_pt = box_pt[:, :, VX:VX+self.vel_dims].contiguous().reshape(1, 1, n, self.vel_dims)
-            _kw2 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
-            if self._mesh_device is not None:
-                _kw2["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-            vel = ttnn.from_torch(vel_pt, **_kw2)
+            vel = ttnn.slice(box_3d, [0, 0, VX], [bs, num_anchor, VX + self.vel_dims])
+            vel = ttnn.reshape(vel, (1, 1, n, self.vel_dims))
             logger.debug("Encoder.run: vel_layers start")
             vel_feat = self._run_layers(vel, self.vel_layers, name="vel")
             ttnn.deallocate(vel)
