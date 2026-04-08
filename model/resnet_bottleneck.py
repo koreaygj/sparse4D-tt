@@ -363,9 +363,12 @@ class Bottleneck:
             act_block_h_override=32,
             shard_layout=shard,
             reallocate_halo_output=True,
+            enable_act_double_buffer=True,
+            enable_weights_double_buffer=True,
             math_fidelity=math_fidelity,
             fp32_dest_acc_en=fp32_dest_acc_en,
         )
+        self.conv2.conv_config.full_inner_dim = True
 
         # conv3: 1x1 expansion (no activation - added after residual)
         s = shapes["conv3"]
@@ -564,10 +567,18 @@ class TtResNetBottleneck:
         self.activation_dtype = activation_dtype
 
         # Conv1: 7x7, stride 2, padding 3
+        # Pad conv1 weight to 4 input channels for TILE-compatible image upload
+        conv1_params = dict(params["conv1"])
+        w = conv1_params["weight"]
+        w_pt = ttnn.to_torch(w).float() if not isinstance(w, torch.Tensor) else w
+        if w_pt.shape[1] == 3:
+            conv1_params["weight"] = ttnn.from_torch(
+                torch.nn.functional.pad(w_pt, (0, 0, 0, 0, 0, 1)), dtype=ttnn.bfloat16)
+
         conv1_shapes = conv_shapes["conv1"]
         self.conv1 = Conv2dOp(
-            params["conv1"], device,
-            in_channels=3,
+            conv1_params, device,
+            in_channels=4,
             out_channels=64,
             kernel_size=(7, 7),
             stride=(2, 2),
