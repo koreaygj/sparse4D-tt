@@ -51,7 +51,7 @@ class SparseBox3DRefinementModule:
         self.embed_dims = embed_dims
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
         )
         self.output_dim = output_dim
         self.num_cls = num_cls
@@ -118,21 +118,18 @@ class SparseBox3DRefinementModule:
     def _run_layers(self, x: ttnn.Tensor, layers: list) -> ttnn.Tensor:
         for idx, entry in enumerate(layers):
             linear_in = x
-            x = ttnn.linear(x, entry["weight"], bias=entry["bias"], compute_kernel_config=self._hifi_compute_config)
-            relu_in = x
-            x = ttnn.relu(x)
+            # Fused linear+relu: single op instead of two
+            x = ttnn.linear(x, entry["weight"], bias=entry["bias"],
+                            activation="relu",
+                            compute_kernel_config=self._hifi_compute_config)
             if "ln_weight" in entry:
-                relu_out = x
+                ln_in = x
                 x = ttnn.layer_norm(
                     x, weight=entry["ln_weight"], bias=entry["ln_bias"],
                     epsilon=1e-5,
                     compute_kernel_config=self._hifi_compute_config,
                 )
-                ttnn.deallocate(relu_in)
-                ttnn.deallocate(relu_out)
-            else:
-                ttnn.deallocate(relu_in)
-            # Deallocate previous layer output (skip idx=0: caller owns input)
+                ttnn.deallocate(ln_in)
             if idx > 0:
                 ttnn.deallocate(linear_in)
         return x
