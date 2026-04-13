@@ -21,7 +21,6 @@
 
 import torch
 import ttnn
-from loguru import logger
 
 # Anchor box field indices
 X, Y, Z = 0, 1, 2
@@ -56,7 +55,7 @@ class SparseBox3DEncoder:
         self._use_host_compute = use_host_compute
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
         )
         self.has_output_fc = has_output_fc
 
@@ -160,28 +159,22 @@ class SparseBox3DEncoder:
         return ttnn.from_torch(tensor.float(), **kwargs)
 
     def _run_layers(self, x: ttnn.Tensor, layers: list, name: str = "") -> ttnn.Tensor:
-        """Run Linear→ReLU (→LN) chain."""
+        """Run Linear+ReLU (→LN) chain with fused activation."""
         for idx, entry in enumerate(layers):
-            logger.debug(f"Encoder._run_layers[{name}][{idx}]: linear start, x={x.shape}")
             linear_in = x
-            x = ttnn.linear(x, entry["weight"], bias=entry["bias"], compute_kernel_config=self._hifi_compute_config)
-            # Deallocate linear input (skip idx=0: caller owns input)
+            x = ttnn.linear(x, entry["weight"], bias=entry["bias"],
+                            activation="relu",
+                            compute_kernel_config=self._hifi_compute_config)
             if idx > 0:
                 ttnn.deallocate(linear_in)
-            logger.debug(f"Encoder._run_layers[{name}][{idx}]: linear done")
-            relu_in = x
-            x = ttnn.relu(x)
             if "ln_weight" in entry:
-                logger.debug(f"Encoder._run_layers[{name}][{idx}]: layer_norm start")
-                relu_out = x
+                ln_in = x
                 x = ttnn.layer_norm(
                     x, weight=entry["ln_weight"], bias=entry["ln_bias"],
                     epsilon=1e-5,
                     compute_kernel_config=self._hifi_compute_config,
                 )
-                ttnn.deallocate(relu_in)
-                ttnn.deallocate(relu_out)
-                logger.debug(f"Encoder._run_layers[{name}][{idx}]: layer_norm done")
+                ttnn.deallocate(ln_in)
         return x
 
     def run(
@@ -201,7 +194,6 @@ class SparseBox3DEncoder:
             output: [bs, num_anchor, output_dims] on device (TILE)
         """
         # Extract components via device slice (no host roundtrip)
-        logger.debug(f"Encoder.run: slice start, box_3d={box_3d.shape}, bs={bs}, num_anchor={num_anchor}")
         n = bs * num_anchor
 
         pos = ttnn.slice(box_3d, [0, 0, X], [bs, num_anchor, Z + 1])        # [bs, 900, 3]
@@ -211,22 +203,15 @@ class SparseBox3DEncoder:
         pos = ttnn.reshape(pos, (1, 1, n, 3))
         size = ttnn.reshape(size, (1, 1, n, 3))
         yaw = ttnn.reshape(yaw, (1, 1, n, 2))
-        logger.debug("Encoder.run: slice done")
 
-        logger.debug("Encoder.run: pos_layers start")
         pos_feat = self._run_layers(pos, self.pos_layers, name="pos")
         ttnn.deallocate(pos)
-        logger.debug("Encoder.run: pos_layers done")
 
-        logger.debug("Encoder.run: size_layers start")
         size_feat = self._run_layers(size, self.size_layers, name="size")
         ttnn.deallocate(size)
-        logger.debug("Encoder.run: size_layers done")
 
-        logger.debug("Encoder.run: yaw_layers start")
         yaw_feat = self._run_layers(yaw, self.yaw_layers, name="yaw")
         ttnn.deallocate(yaw)
-        logger.debug("Encoder.run: yaw_layers done")
 
         if self.mode == "add":
             output = ttnn.add(ttnn.add(pos_feat, size_feat), yaw_feat)
@@ -235,16 +220,12 @@ class SparseBox3DEncoder:
         ttnn.deallocate(pos_feat)
         ttnn.deallocate(size_feat)
         ttnn.deallocate(yaw_feat)
-        logger.debug(f"Encoder.run: combine done, mode={self.mode}")
 
         if self.vel_dims > 0:
             vel = ttnn.slice(box_3d, [0, 0, VX], [bs, num_anchor, VX + self.vel_dims])
             vel = ttnn.reshape(vel, (1, 1, n, self.vel_dims))
-            logger.debug("Encoder.run: vel_layers start")
             vel_feat = self._run_layers(vel, self.vel_layers, name="vel")
             ttnn.deallocate(vel)
-            logger.debug("Encoder.run: vel_layers done")
-            logger.debug(f"Encoder.run: vel combine start, mode={self.mode}")
             old_output = output
             if self.mode == "add":
                 output = ttnn.add(old_output, vel_feat)
@@ -252,14 +233,11 @@ class SparseBox3DEncoder:
                 output = ttnn.concat([old_output, vel_feat], dim=-1)
             ttnn.deallocate(old_output)
             ttnn.deallocate(vel_feat)
-            logger.debug(f"Encoder.run: vel combine done, output={output.shape}")
 
         if self.has_output_fc:
             output = self._run_layers(output, self.out_layers)
 
-        logger.debug(f"Encoder.run: reshape start, target=({bs}, {num_anchor}, {self.output_dims}), current={output.shape}")
         output = ttnn.reshape(output, (bs, num_anchor, self.output_dims))
-        logger.debug(f"Encoder.run: done, output={output.shape}")
         return output
 
     def _run_host(
@@ -274,7 +252,6 @@ class SparseBox3DEncoder:
         The encoder processes small tensors ([bs, 900, 11] → [bs, 900, 256]),
         so host compute has negligible PCIe overhead compared to accuracy gain.
         """
-        logger.debug("Encoder._run_host: start")
         pos_in = box_pt[:, :, X:Z+1].contiguous().reshape(n, 3)
         size_in = box_pt[:, :, W:H+1].contiguous().reshape(n, 3)
         yaw_in = box_pt[:, :, SIN_YAW:COS_YAW+1].contiguous().reshape(n, 2)
@@ -301,7 +278,6 @@ class SparseBox3DEncoder:
                 output = self._run_layers_host(output, self.out_layers_host)
 
         output = output.reshape(bs, num_anchor, self.output_dims)
-        logger.debug(f"Encoder._run_host: done, shape={output.shape}")
 
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
