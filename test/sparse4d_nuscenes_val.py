@@ -1180,11 +1180,12 @@ def main():
     if args.dual_device and num_devices >= 2:
         # Full mesh SPMD mode
         print(f"  {num_devices} chips detected, opening mesh (1x2)...")
-        mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=24576)
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=32768)
         device = mesh_device  # everything runs on mesh
         print(f"  Mesh device IDs: {mesh_device.get_device_ids()}")
     else:
-        device = ttnn.open_device(device_id=0, l1_small_size=24576)
+        device = ttnn.open_device(device_id=0, l1_small_size=32768)
         if num_devices >= 2:
             print(f"  {num_devices} chips detected, using single device")
         else:
