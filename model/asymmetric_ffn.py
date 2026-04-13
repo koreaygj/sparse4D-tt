@@ -44,7 +44,7 @@ class AsymmetricFFN:
         self.feedforward_channels = feedforward_channels
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
         )
 
         # pre_norm: LayerNorm(in_channels)
@@ -64,6 +64,18 @@ class AsymmetricFFN:
             self.identity_fc_weight = self._to_device(parameters["identity_fc_weight"])
             self.identity_fc_bias = self._to_device_bias(parameters["identity_fc_bias"])
             self.has_identity_fc = True
+            # Fused identity+fc1: combined weight [in_channels, embed_dims+feedforward]
+            import torch as _torch
+            w_fused = _torch.cat([parameters["identity_fc_weight"], parameters["fc1_weight"]], dim=-1)
+            b_id = parameters["identity_fc_bias"]
+            b_fc1 = parameters["fc1_bias"]
+            if b_id.dim() == 1:
+                b_id = b_id.reshape(1, 1, 1, -1)
+            if b_fc1.dim() == 1:
+                b_fc1 = b_fc1.reshape(1, 1, 1, -1)
+            b_fused = _torch.cat([b_id, b_fc1], dim=-1)
+            self.w_identity_fc1 = self._to_device(w_fused)
+            self.b_identity_fc1 = self._to_device_bias(b_fused.squeeze())
         else:
             self.has_identity_fc = False
 
@@ -112,14 +124,20 @@ class AsymmetricFFN:
                                   epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
 
         if self.has_identity_fc:
-            identity = ttnn.linear(normed, self.identity_fc_weight, bias=self.identity_fc_bias,
+            # Fused identity_fc + fc1: one matmul [512, 1280] instead of [512, 256] + [512, 1024]
+            fused_out = ttnn.linear(normed, self.w_identity_fc1, bias=self.b_identity_fc1,
                                     compute_kernel_config=self._hifi_compute_config)
+            ttnn.deallocate(normed)
+            identity = ttnn.slice(fused_out, [0, 0, 0, 0],
+                                  [1, 1, bs * num_tokens, self.embed_dims])
+            fc1_out = ttnn.slice(fused_out, [0, 0, 0, self.embed_dims],
+                                 [1, 1, bs * num_tokens, self.embed_dims + self.feedforward_channels])
+            ttnn.deallocate(fused_out)
         else:
             identity = normed
+            fc1_out = ttnn.linear(normed, self.fc1_weight, bias=self.fc1_bias,
+                                  compute_kernel_config=self._hifi_compute_config)
 
-        fc1_out = ttnn.linear(normed, self.fc1_weight, bias=self.fc1_bias, compute_kernel_config=self._hifi_compute_config)
-        if self.has_identity_fc:
-            ttnn.deallocate(normed)
         relu_out = ttnn.relu(fc1_out)
         projected = ttnn.linear(relu_out, self.fc2_weight, bias=self.fc2_bias, compute_kernel_config=self._hifi_compute_config)
         ttnn.deallocate(fc1_out); ttnn.deallocate(relu_out)
