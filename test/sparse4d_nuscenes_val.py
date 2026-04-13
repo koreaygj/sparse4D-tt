@@ -388,7 +388,7 @@ def _build_head_from_sd(sd, device, mesh_device=None):
     return head
 
 
-def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp32_backbone=False, fidelity_override=None):
+def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp32_backbone=False, fidelity_override=None, use_grid_sample_lerp=False):
     """Load full TT-NN Sparse4D model from checkpoint.
 
     Args:
@@ -452,6 +452,14 @@ def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp
                         obj.compute_config = new_config
         _override_backbone(backbone)
         print(f"  Fidelity override: {fidelity_override} (fp32_acc={fp32_acc}) applied to Backbone + FPN + Head")
+
+    # Override grid_sample variant for DFA
+    if use_grid_sample_lerp:
+        from model.deformable_feature_aggregation import DeformableFeatureAggregation
+        for layer in head.layers:
+            if isinstance(layer, DeformableFeatureAggregation):
+                layer._use_grid_sample_lerp = True
+        print("  Grid sample: using ttnn.grid_sample_lerp")
 
     model = Sparse4DInference(device, backbone, fpn, head)
     print("  Model build complete.")
@@ -1123,6 +1131,11 @@ def main():
         help="Use BF8 QAT finetuned checkpoint (ckpt/bf8_latest.pth)",
     )
     parser.add_argument(
+        "--grid-sample-lerp",
+        action="store_true",
+        help="Use ttnn.grid_sample_lerp instead of grid_sample in DFA",
+    )
+    parser.add_argument(
         "--fidelity",
         type=str,
         choices=["lofi", "hifi2", "hifi4"],
@@ -1167,11 +1180,12 @@ def main():
     if args.dual_device and num_devices >= 2:
         # Full mesh SPMD mode
         print(f"  {num_devices} chips detected, opening mesh (1x2)...")
-        mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=24576)
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=32768)
         device = mesh_device  # everything runs on mesh
         print(f"  Mesh device IDs: {mesh_device.get_device_ids()}")
     else:
-        device = ttnn.open_device(device_id=0, l1_small_size=24576)
+        device = ttnn.open_device(device_id=0, l1_small_size=32768)
         if num_devices >= 2:
             print(f"  {num_devices} chips detected, using single device")
         else:
@@ -1181,7 +1195,7 @@ def main():
         if args.dual_device and mesh_device is not None:
             # Full mesh SPMD: backbone+FPN+Head all on mesh_device (bf16)
             # backbone batch=3 per device (SPMD), Head replicated on mesh
-            model = load_model(args.ckpt, mesh_device, mesh_device=mesh_device, backbone_batch_size=3, fp32_backbone=False, fidelity_override=args.fidelity)
+            model = load_model(args.ckpt, mesh_device, mesh_device=mesh_device, backbone_batch_size=3, fp32_backbone=False, fidelity_override=args.fidelity, use_grid_sample_lerp=args.grid_sample_lerp)
 
             model.mesh_parallel_mode = True
             model._mesh_device = mesh_device
@@ -1190,12 +1204,12 @@ def main():
             print("  Full mesh SPMD mode: backbone+FPN+Head all on mesh_device (bf16)")
         elif args.dual_device:
             # Fallback: serial batch=3 x 2 on single device
-            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=3, fp32_backbone=False, fidelity_override=args.fidelity)
+            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=3, fp32_backbone=False, fidelity_override=args.fidelity, use_grid_sample_lerp=args.grid_sample_lerp)
             model.serial_cams_per_batch = 3
             print("  HiFi4+fp32_acc mode: serial batch=3 x 2 runs (single device)")
         else:
             # Single device mode: batch=6, all on-device
-            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=6, fp32_backbone=False, fidelity_override=args.fidelity)
+            model = load_model(args.ckpt, device, mesh_device=None, backbone_batch_size=6, fp32_backbone=False, fidelity_override=args.fidelity, use_grid_sample_lerp=args.grid_sample_lerp)
             model.serial_cams_per_batch = 0
             print("  Direct batch mode: 6 cameras, no serial (all on-device)")
 

@@ -25,7 +25,6 @@
 
 import torch
 import ttnn
-from loguru import logger
 
 
 class MultiheadAttention:
@@ -63,6 +62,18 @@ class MultiheadAttention:
         self.b_k = self._to_device_bias(parameters["b_k"])
         self.w_v = self._to_device(parameters["w_v"])
         self.b_v = self._to_device_bias(parameters["b_v"])
+
+        # Combined QKV weight for self-attention (fused linear)
+        w_qkv_pt = torch.cat([parameters["w_q"], parameters["w_k"], parameters["w_v"]], dim=-1)
+        b_qkv_pt = torch.cat([parameters["b_q"], parameters["b_k"], parameters["b_v"]], dim=-1)
+        self.w_qkv = self._to_device(w_qkv_pt)
+        self.b_qkv = self._to_device_bias(b_qkv_pt)
+
+        # Combined QK weight for query=key case (fused Q+K linear, V separate)
+        w_qk_pt = torch.cat([parameters["w_q"], parameters["w_k"]], dim=-1)
+        b_qk_pt = torch.cat([parameters["b_q"], parameters["b_k"]], dim=-1)
+        self.w_qk = self._to_device(w_qk_pt)
+        self.b_qk = self._to_device_bias(b_qk_pt)
 
         # Output projection
         self.w_out = self._to_device(parameters["w_out"])
@@ -123,39 +134,60 @@ class MultiheadAttention:
             value = query
 
         # --- 1. Linear projections ---
-        logger.debug("MHA: Q reshape start")
-        q_flat = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
-        logger.debug(f"MHA: Q linear start, q={q_flat.shape}")
-        q = ttnn.linear(q_flat, self.w_q, bias=self.b_q, compute_kernel_config=self._hifi_compute_config)
-        k_flat = ttnn.reshape(key, (1, 1, bs * num_keys, self.embed_dims))
-        k = ttnn.linear(k_flat, self.w_k, bias=self.b_k, compute_kernel_config=self._hifi_compute_config)
-        v_flat = ttnn.reshape(value, (1, 1, bs * num_keys, self.embed_dims))
-        v = ttnn.linear(v_flat, self.w_v, bias=self.b_v, compute_kernel_config=self._hifi_compute_config)
+        if query is key and query is value:
+            # True self-attention: fused QKV (1 linear instead of 3)
+            q_flat = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
+            qkv = ttnn.linear(q_flat, self.w_qkv, bias=self.b_qkv,
+                              compute_kernel_config=self._hifi_compute_config)
+            q = ttnn.slice(qkv, [0, 0, 0, 0], [1, 1, bs * num_queries, self.embed_dims])
+            k = ttnn.slice(qkv, [0, 0, 0, self.embed_dims], [1, 1, bs * num_keys, 2 * self.embed_dims])
+            v = ttnn.slice(qkv, [0, 0, 0, 2 * self.embed_dims], [1, 1, bs * num_keys, 3 * self.embed_dims])
+            ttnn.deallocate(qkv)
+        elif query is key:
+            # query=key, value different: fused Q+K (2 linears instead of 3)
+            q_flat = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
+            qk = ttnn.linear(q_flat, self.w_qk, bias=self.b_qk,
+                             compute_kernel_config=self._hifi_compute_config)
+            q = ttnn.slice(qk, [0, 0, 0, 0], [1, 1, bs * num_queries, self.embed_dims])
+            k = ttnn.slice(qk, [0, 0, 0, self.embed_dims], [1, 1, bs * num_keys, 2 * self.embed_dims])
+            ttnn.deallocate(qk)
+            v_flat = ttnn.reshape(value, (1, 1, bs * num_keys, self.embed_dims))
+            v = ttnn.linear(v_flat, self.w_v, bias=self.b_v, compute_kernel_config=self._hifi_compute_config)
+        else:
+            q_flat = ttnn.reshape(query, (1, 1, bs * num_queries, self.embed_dims))
+            q = ttnn.linear(q_flat, self.w_q, bias=self.b_q, compute_kernel_config=self._hifi_compute_config)
+            k_flat = ttnn.reshape(key, (1, 1, bs * num_keys, self.embed_dims))
+            k = ttnn.linear(k_flat, self.w_k, bias=self.b_k, compute_kernel_config=self._hifi_compute_config)
+            v_flat = ttnn.reshape(value, (1, 1, bs * num_keys, self.embed_dims))
+            v = ttnn.linear(v_flat, self.w_v, bias=self.b_v, compute_kernel_config=self._hifi_compute_config)
 
-        # Multi-head reshape + permute
-        q = ttnn.reshape(q, (bs, num_queries, self.num_heads, self.head_dim))
-        q = ttnn.permute(q, (0, 2, 1, 3))
-        k = ttnn.reshape(k, (bs, num_keys, self.num_heads, self.head_dim))
-        k = ttnn.permute(k, (0, 2, 1, 3))
-        v = ttnn.reshape(v, (bs, num_keys, self.num_heads, self.head_dim))
-        v = ttnn.permute(v, (0, 2, 1, 3))
+        # Multi-head split: fused reshape+transpose when Q/K same length
+        if num_queries == num_keys:
+            qkv_cat = ttnn.concat([q, k, v], dim=-1)
+            qkv_cat = ttnn.reshape(qkv_cat, (bs, num_queries, 3 * self.embed_dims))
+            q, k, v = ttnn.transformer.split_query_key_value_and_split_heads(
+                qkv_cat, num_heads=self.num_heads, transpose_key=False)
+            ttnn.deallocate(qkv_cat)
+        else:
+            # Cross-attention: pad K/V to match Q length for fused split_heads
+            k = ttnn.pad(k, [(0,0),(0,0),(0, num_queries - num_keys),(0,0)], 0.0)
+            v = ttnn.pad(v, [(0,0),(0,0),(0, num_queries - num_keys),(0,0)], 0.0)
+            qkv_cat = ttnn.concat([q, k, v], dim=-1)
+            qkv_cat = ttnn.reshape(qkv_cat, (bs, num_queries, 3 * self.embed_dims))
+            q, k, v = ttnn.transformer.split_query_key_value_and_split_heads(
+                qkv_cat, num_heads=self.num_heads, transpose_key=False)
+            ttnn.deallocate(qkv_cat)
 
-        # Scaled dot-product attention
-        k_t = ttnn.transpose(k, -2, -1)
-        attn_weights = ttnn.matmul(q, k_t, compute_kernel_config=self._hifi_compute_config)
-        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(k_t)
+        # Scaled dot-product attention via SDPA kernel (FlashAttention-2)
+        attn_output = ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, is_causal=False)
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
 
-        attn_weights = ttnn.multiply(attn_weights, self.scale)
-        attn_weights = ttnn.softmax(attn_weights, dim=-1, numeric_stable=True,
-                                    compute_kernel_config=self._hifi_compute_config)
-
-        attn_output = ttnn.matmul(attn_weights, v, compute_kernel_config=self._hifi_compute_config)
-        ttnn.deallocate(attn_weights); ttnn.deallocate(v)
-
-        # Reshape back + output projection
-        attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
+        # Reshape back: [b, nh, s, d] → [b, s, nh*d] via concatenate_heads
+        attn_output = ttnn.transformer.concatenate_heads(attn_output)
         attn_output = ttnn.reshape(attn_output, (1, 1, bs * num_queries, self.embed_dims))
-        output = ttnn.linear(attn_output, self.w_out, bias=self.b_out, compute_kernel_config=self._hifi_compute_config)
+        output = ttnn.linear(attn_output, self.w_out, bias=self.b_out,
+                             compute_kernel_config=self._hifi_compute_config)
         ttnn.deallocate(attn_output)
 
         # --- 6. Residual connection ---

@@ -33,7 +33,6 @@ from typing import Dict, List, Tuple
 
 import torch
 import ttnn
-from loguru import logger
 
 
 class FPN:
@@ -105,9 +104,6 @@ class FPN:
         lateral_spatial = []
         for i in range(self.num_levels):
             h, w = self.input_spatial_shapes[i]
-            logger.debug(
-                f"==== FPN lateral conv {i}: in_ch={self.in_channels[i]}, spatial={h}x{w}"
-            )
 
             x = features[i]
             # Ensure on DRAM interleaved for conv2d input
@@ -157,9 +153,6 @@ class FPN:
         for i in range(self.num_levels - 1, 0, -1):
             h_lower, w_lower = lateral_spatial[i - 1]
             h_upper, w_upper = lateral_spatial[i]
-            logger.debug(
-                f"==== FPN top-down: level {i}({h_upper}x{w_upper}) -> level {i - 1}({h_lower}x{w_lower})"
-            )
 
             upper = laterals[i]
 
@@ -200,7 +193,6 @@ class FPN:
         outs = []
         for i in range(self.num_levels):
             h, w = lateral_spatial[i]
-            logger.debug(f"==== FPN output conv {i}: 256ch, spatial={h}x{w}")
 
             x = laterals[i]
             x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)

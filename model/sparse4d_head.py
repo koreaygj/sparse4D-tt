@@ -21,7 +21,6 @@
 
 import torch
 import ttnn
-from loguru import logger
 
 from model.multihead_attention import MultiheadAttention, preprocess_mha_parameters
 from model.asymmetric_ffn import AsymmetricFFN, preprocess_ffn_parameters
@@ -195,7 +194,6 @@ class Sparse4DHead:
                     model_config={},
                     mesh_device=mesh_device,
                 )
-        logger.info(f"Mesh DFA: {len(self._mesh_dfa_runners)} runners on 2 submeshes")
 
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -289,7 +287,13 @@ class Sparse4DHead:
         num_anchor = self.num_anchor
         debug_intermediates = {}
 
-        # (Legacy mesh DFA cache clearing removed - using native mesh SPMD now)
+        # Clear per-frame DFA caches
+        for i, op in enumerate(self.operation_order):
+            if op == "deformable" and self.layers[i] is not None:
+                self.layers[i]._cached_camera_embed = None
+                self.layers[i]._host_proj = None
+                self.layers[i]._host_wh = None
+                self.layers[i]._cached_proj_rm = None  # proj changes per frame
 
         # 1. InstanceBank.get()
         (
@@ -316,28 +320,33 @@ class Sparse4DHead:
             temp_anchor_embed = None
             num_temp = 0
 
-        # 3. Pre-allocate projection_mat and image_wh on device (reused across decoder loop)
+        # 3. Pre-allocate projection_mat and image_wh on device
         proj_pt = metas["projection_mat"].float()
-        wh_pt = metas["image_wh"].float()
         if self._mesh_device is not None:
-            # Shard full proj/wh by camera dim: [1,6,4,4] → each device gets [1,3,4,4]
             proj_tt = ttnn.from_torch(
                 proj_pt,
                 layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
                 mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
             )
-            wh_tt = ttnn.from_torch(
-                wh_pt,
-                layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
-                mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
-            )
+            # image_wh is constant across frames — cache on device
+            if not hasattr(self, '_cached_wh_tt') or self._cached_wh_tt is None:
+                wh_pt = metas["image_wh"].float()
+                self._cached_wh_tt = ttnn.from_torch(
+                    wh_pt,
+                    layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                    mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
+                )
+            wh_tt = self._cached_wh_tt
         else:
             proj_tt = ttnn.from_torch(
                 proj_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
             )
-            wh_tt = ttnn.from_torch(
-                wh_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
-            )
+            if not hasattr(self, '_cached_wh_tt') or self._cached_wh_tt is None:
+                wh_pt = metas["image_wh"].float()
+                self._cached_wh_tt = ttnn.from_torch(
+                    wh_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                )
+            wh_tt = self._cached_wh_tt
 
         # 4. Decoder loop
         prediction = []
@@ -345,9 +354,6 @@ class Sparse4DHead:
         quality = []
 
         for i, op in enumerate(self.operation_order):
-            logger.debug(f"Head decoder: op[{i}]={op} start, inst_feat dtype={instance_feature.dtype}")
-            logger.debug(f"Head decoder: op[{i}]={op} sync start")
-            logger.debug(f"Head decoder: op[{i}]={op} sync done")
 
             if self.layers[i] is None:
                 continue
@@ -416,12 +422,10 @@ class Sparse4DHead:
                     len(prediction) == self.num_single_frame_decoder - 1
                     or i == len(self.operation_order) - 1
                 )
-                logger.debug(f"Head refine[{i}]: refine.run start, return_cls={return_cls}")
                 anchor, cls, qt = refine.run(
                     instance_feature, anchor, anchor_embed, time_interval,
                     bs=bs, num_anchor=num_anchor, return_cls=return_cls,
                 )
-                logger.debug(f"Head refine[{i}]: refine.run done")
                 prediction.append(anchor)
                 classification.append(cls)
                 quality.append(qt)
@@ -429,7 +433,6 @@ class Sparse4DHead:
                 # After single-frame decoder: update instances
                 if len(prediction) == self.num_single_frame_decoder:
                     if cls is not None:
-                        logger.debug(f"Head refine[{i}]: instance_bank.update start")
                         old_instance_feature = instance_feature
                         instance_feature, anchor = self.instance_bank.update(
                             instance_feature, anchor, cls, bs=bs,
@@ -437,17 +440,14 @@ class Sparse4DHead:
                         # Only deallocate if update created a new tensor
                         if instance_feature is not old_instance_feature:
                             ttnn.deallocate(old_instance_feature)
-                        logger.debug(f"Head refine[{i}]: instance_bank.update done")
 
                 # Re-encode anchor (except at last step)
                 if i != len(self.operation_order) - 1:
-                    logger.debug(f"Head refine[{i}]: anchor_encoder.run start")
                     old_anchor_embed = anchor_embed
                     anchor_embed = self.anchor_encoder.run(
                         anchor, bs=bs, num_anchor=num_anchor
                     )
                     ttnn.deallocate(old_anchor_embed)
-                    logger.debug(f"Head refine[{i}]: anchor_encoder.run done, anchor_embed={anchor_embed.shape}")
 
                 # Update temp_anchor_embed after single-frame decoder
                 if (
@@ -459,7 +459,6 @@ class Sparse4DHead:
                         [0, 0, 0],
                         [bs, self.num_temp_instances, self.embed_dims],
                     )
-                    logger.debug(f"Head refine[{i}]: temp_anchor_embed updated")
 
             if debug:
                 debug_intermediates[f"step_{i}_{op}"] = ttnn.to_torch(instance_feature)
@@ -468,7 +467,7 @@ class Sparse4DHead:
 
         # 5. Deallocate projection_mat and image_wh
         ttnn.deallocate(proj_tt)
-        ttnn.deallocate(wh_tt)
+        # wh_tt is cached, don't deallocate
 
         # 6. Cache for next frame
         last_cls = classification[-1]

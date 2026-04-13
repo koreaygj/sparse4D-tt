@@ -21,7 +21,6 @@
 import numpy as np
 import torch
 import ttnn
-from loguru import logger
 
 from model.resnet_bottleneck import create_tt_resnet_bottleneck
 from model.fpn import FPN, preprocess_fpn_parameters
@@ -118,14 +117,6 @@ def _dual_device_worker(device_id, images_3cam, ckpt_path, fpn_fp32, result_dict
         )
         backbone_features = backbone(tt_input)
 
-        # Upcast if needed
-        backbone_features = [
-            _ttnn.typecast(f, _ttnn.bfloat16)
-            if f.dtype != _ttnn.bfloat16 and f.dtype == _ttnn.bfloat8_b
-            else f
-            for f in backbone_features
-        ]
-
         # Run FPN
         fpn_features = fpn.run(backbone_features, device)
         _ttnn.synchronize_device(device)
@@ -206,10 +197,8 @@ class Sparse4DInference:
             device: TT device
             pt_model: PyTorch Sparse4D model (from mmdet3d)
         """
-        logger.info("Building TT-NN Sparse4D from PyTorch model...")
 
         # 1. Backbone (TtResNetBottleneck)
-        logger.info("  Building ResNet50 backbone...")
         backbone, _ = create_tt_resnet_bottleneck(
             torch_model=pt_model.img_backbone,
             device=device,
@@ -220,7 +209,6 @@ class Sparse4DInference:
         )
 
         # 2. FPN
-        logger.info("  Building FPN neck...")
         fpn_params = preprocess_fpn_parameters(pt_model.img_neck)
         fpn = FPN(
             device=device,
@@ -230,14 +218,13 @@ class Sparse4DInference:
             out_channels=embed_dims,
             model_config={
                 "WEIGHTS_DTYPE": activation_dtype,
-                "ACTIVATIONS_DTYPE": ttnn.float32,
+                "ACTIVATIONS_DTYPE": ttnn.bfloat16,
                 "MATH_FIDELITY": ttnn.MathFidelity.HiFi2,
             },
             input_spatial_shapes=SPATIAL_SHAPES,
         )
 
         # 3. Sparse4DHead
-        logger.info("  Building Sparse4DHead...")
         head_params = preprocess_sparse4d_head_parameters(pt_model.head)
 
         operation_order = list(pt_model.head.operation_order)
@@ -256,10 +243,25 @@ class Sparse4DInference:
             spatial_shapes=SPATIAL_SHAPES,
         )
 
-        logger.info("  Build complete.")
         model = cls(device, backbone, fpn, head, num_cams, embed_dims)
         model.activation_dtype = activation_dtype
         return model
+
+    def _prepare_host_input(self, images):
+        """Pre-tilize images on host (no device upload)."""
+        import ttnn as _ttnn
+        bs = images.shape[0]
+        imgs_flat = images.reshape(bs * self.num_cams, 3, 256, 704)
+        imgs_nhwc = imgs_flat.permute(0, 2, 3, 1).contiguous()
+        half = self.num_cams // 2
+        imgs_0 = imgs_nhwc[:half].reshape(1, 1, half * 256 * 704, 3)
+        imgs_1 = imgs_nhwc[half:].reshape(1, 1, half * 256 * 704, 3)
+        pad_0 = torch.nn.functional.pad(imgs_0, (0, 1), value=0)
+        pad_1 = torch.nn.functional.pad(imgs_1, (0, 1), value=0)
+        stacked = torch.cat([pad_0, pad_1], dim=0)
+        # Host-only tensor (TILE layout, no device)
+        return _ttnn.from_torch(stacked.bfloat16(), layout=_ttnn.TILE_LAYOUT,
+                                mesh_mapper=_ttnn.ShardTensorToMesh(self._mesh_device, dim=0))
 
     def preprocess_images(self, images: torch.Tensor):
         """Preprocess and send images to TT device.
@@ -320,19 +322,9 @@ class Sparse4DInference:
             return self._extract_features_serial(input_tensor)
 
         # Backbone: → [c2, c3, c4, c5]
-        logger.debug("Running backbone...")
         backbone_features = self.backbone(input_tensor)
 
-        # Upcast to activation_dtype before FPN (e.g. bfloat8_b → bfloat16)
-        backbone_features = [
-            ttnn.typecast(f, self.activation_dtype)
-            if f.dtype != self.activation_dtype and f.dtype == ttnn.bfloat8_b
-            else f
-            for f in backbone_features
-        ]
-
         # FPN: → [p2, p3, p4, p5]
-        logger.debug("Running FPN...")
         fpn_features = self.fpn.run(backbone_features, self.device)
 
         # Convert to float32 for head
@@ -356,18 +348,9 @@ class Sparse4DInference:
         all_fpn_torch = [[] for _ in range(4)]  # 4 FPN levels
 
         for batch_idx, inp in enumerate(input_tensors):
-            logger.debug(f"Serial backbone+FPN batch {batch_idx}/{num_batches}...")
 
             # Backbone
             backbone_features = self.backbone(inp)
-
-            # Upcast to activation_dtype if needed
-            backbone_features = [
-                ttnn.typecast(f, self.activation_dtype)
-                if f.dtype != self.activation_dtype and f.dtype == ttnn.bfloat8_b
-                else f
-                for f in backbone_features
-            ]
 
             # FPN
             fpn_features = self.fpn.run(backbone_features, self.device)
@@ -387,10 +370,8 @@ class Sparse4DInference:
                     pass
 
             ttnn.synchronize_device(self.device)
-            logger.debug(f"Serial batch {batch_idx} done, device memory freed")
 
         # Concat batches on host, send to device as float32
-        logger.debug("Concatenating serial FPN batches...")
         fpn_combined = []
         self._debug_fpn_torch = []  # Save for debug comparison
         for level_idx in range(4):
@@ -404,7 +385,6 @@ class Sparse4DInference:
                 dtype=ttnn.float32,
             )
             fpn_combined.append(f_tt)
-        logger.debug("Serial FPN features ready on device")
 
         return fpn_combined
 
@@ -481,12 +461,6 @@ class Sparse4DInference:
 
         # Backbone on device 0
         backbone_features = self.backbone(tt_input)
-        backbone_features = [
-            ttnn.typecast(f, self.activation_dtype)
-            if f.dtype != self.activation_dtype and f.dtype == ttnn.bfloat8_b
-            else f
-            for f in backbone_features
-        ]
 
         # FPN on device 0
         fpn_features_0 = self.fpn.run(backbone_features, self.device)
@@ -528,7 +502,6 @@ class Sparse4DInference:
             )
             fpn_combined.append(f_tt)
 
-        logger.debug("Dual-device FPN features combined on device 0")
         return fpn_combined
 
     def _extract_features_mesh_parallel(self, images: torch.Tensor) -> list:
@@ -546,41 +519,25 @@ class Sparse4DInference:
         """
         imgs_flat = images.reshape(self.num_cams, 3, 256, 704)
 
-        # NHWC + flatten: [6, 256, 704, 3] → [1, 1, 6*256*704, 3]
-        # But we need to shard so each device gets 3 cams.
-        # Shard as [2, 1, 3*256*704, 3] along dim=0 → each device gets [1, 1, 3*H*W, 3]
-        imgs_nhwc = imgs_flat.permute(0, 2, 3, 1).contiguous()  # [6, 256, 704, 3]
-        # Split into 2 halves: [3, 256, 704, 3] each, flatten to [1, 1, 3*H*W, 3]
-        imgs_flat_0 = imgs_nhwc[:3].reshape(1, 1, 3 * 256 * 704, 3)
-        imgs_flat_1 = imgs_nhwc[3:].reshape(1, 1, 3 * 256 * 704, 3)
-        # Stack along dim=0 for ShardTensorToMesh
-        imgs_stacked = torch.cat([imgs_flat_0, imgs_flat_1], dim=0)  # [2, 1, 3*H*W, 3]
+        # Fast upload via persistent device buffer
+        if hasattr(self, '_next_host_input') and self._next_host_input is not None:
+            host_input = self._next_host_input
+            self._next_host_input = None
+        else:
+            host_input = self._prepare_host_input(images)
 
-        tt_input = ttnn.from_torch(
-            imgs_stacked.float(),
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self._mesh_device,
-            dtype=self.activation_dtype,
-            mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=0),
-        )
+        if not hasattr(self, '_img_dev_slot') or self._img_dev_slot is None:
+            self._img_dev_slot = ttnn.allocate_tensor_on_device(
+                ttnn.Shape([1, 1, 3 * 256 * 704, 4]),
+                ttnn.bfloat16, ttnn.TILE_LAYOUT, self._mesh_device)
+        ttnn.copy_host_to_device_tensor(host_input, self._img_dev_slot)
+        tt_input = self._img_dev_slot
 
         # Backbone SPMD: each device processes its 3 cameras
-        logger.debug("Mesh SPMD: backbone start")
         backbone_features = self.backbone(tt_input)
-        logger.debug("Mesh SPMD: backbone done")
-
-        # Upcast if needed
-        backbone_features = [
-            ttnn.typecast(f, self.activation_dtype)
-            if f.dtype != self.activation_dtype and f.dtype == ttnn.bfloat8_b
-            else f
-            for f in backbone_features
-        ]
 
         # FPN SPMD
-        logger.debug("Mesh SPMD: FPN start")
         fpn_features = self.fpn.run(backbone_features, self._mesh_device)
-        logger.debug("Mesh SPMD: FPN done")
 
         # Deallocate backbone features
         for bf in backbone_features:
@@ -600,7 +557,6 @@ class Sparse4DInference:
                 f = ttnn.typecast(f, ttnn.bfloat16)
             fpn_features[level_idx] = f
 
-        logger.debug("Mesh SPMD: FPN features reshaped for DFA")
         return fpn_features
 
     def reset(self):

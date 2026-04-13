@@ -11,7 +11,7 @@
 #      - rotation + translation: HOST (ttnn.slice hang workaround, small tensor ~35K elements)
 #   2. project_points: 3D → 2D via projection matrix (ttnn.matmul, device)
 #   3. get_weights: instance_feature → attention weights (ttnn.linear + softmax, device)
-#   4. feature_sampling: grid_sample per FPN level (ttnn.grid_sample_lerp, device)
+#   4. feature_sampling: grid_sample per FPN level (ttnn.grid_sample, device)
 #      - lerp-based bilinear: 2-pass lerp reduces BF16 rounding from 2x to 1x
 #   5. multi_view_level_fusion: weighted sum (ttnn.multiply + ttnn.sum, device)
 #   6. output_proj: ttnn.linear + residual (device)
@@ -21,7 +21,16 @@ from typing import Dict, List, Tuple
 
 import torch
 import ttnn
-from loguru import logger
+
+# Custom kernel mode: auto-detect, or override via environment variable
+# TT_CUSTOM_KERNELS=0 → force pure ttnn, TT_CUSTOM_KERNELS=1 → force custom kernels
+import os as _os
+_KERNELS_AVAILABLE = all(hasattr(ttnn, op) for op in ["kps_project_fused", "transposed_s2i", "grouped_weighted_sum"])
+_env = _os.environ.get("TT_CUSTOM_KERNELS")
+if _env is not None:
+    _HAS_CUSTOM_KERNELS = _env == "1"
+else:
+    _HAS_CUSTOM_KERNELS = _KERNELS_AVAILABLE
 
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
@@ -31,7 +40,6 @@ VX, VY, VZ = 8, 9, 10
 
 
 class DeformableFeatureAggregation:
-
     def __init__(
         self,
         device,
@@ -60,7 +68,7 @@ class DeformableFeatureAggregation:
         self.residual_mode = residual_mode
         self.model_config = model_config
 
-        # HiFi compute config for precision-sensitive operations
+        # HiFi2 compute config
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi2,
@@ -69,13 +77,53 @@ class DeformableFeatureAggregation:
             math_approx_mode=False,
         )
 
+        # Weight CLP reorder index: camera-major → level-major
+        # Needed because transposed grid produces level-major feature ordering
+        total_clp = num_cams * num_levels * num_pts  # 156
+        perm = []
+        for l in range(num_levels):
+            for c in range(num_cams):
+                for p in range(num_pts):
+                    perm.append(c * num_levels * num_pts + l * num_pts + p)
+        _perm_t = torch.tensor(perm, dtype=torch.int32).reshape(1, total_clp, 1)
+        _perm_t = _perm_t.expand(900, total_clp, num_groups).contiguous()
+        _perm_kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.uint32)
+        if self._mesh_device is not None:
+            _perm_kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        self._wt_perm_idx = ttnn.from_torch(_perm_t, **_perm_kw)
+
+        # L1 sharded grid config for grid_sample (PR #28308)
+        # kps_project_fused output: [nc, N, 1, 32] (padded from 26, L1-aligned)
+        # total sticks = nc*N = 2700, K = 32/2 = 16 (13 real + 3 padding zeros)
+        _total_sticks = num_cams * 900  # 2700
+        _shard_h = (_total_sticks + 55) // 56  # 49
+        _padded_last = ((num_pts * 2 + 7) // 8) * 8  # 26 → 32
+        _core_grid = ttnn.CoreRangeSet(
+            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 6))}
+        )
+        _shard_spec = ttnn.ShardSpec(
+            _core_grid, (_shard_h, _padded_last), ttnn.ShardOrientation.ROW_MAJOR
+        )
+        self._grid_sharded_mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec
+        )
+
+        # L1 sharded config for precomputed grid (pts*6 per point instead of pts*2)
+        _padded_precomputed = ((num_pts * 6 + 7) // 8) * 8  # 78 → 80
+        _shard_spec_precomputed = ttnn.ShardSpec(
+            _core_grid, (_shard_h, _padded_precomputed), ttnn.ShardOrientation.ROW_MAJOR
+        )
+        self._grid_precomputed_sharded_mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec_precomputed
+        )
+
         # Pre-allocate scalar constants on device (reused per camera in _project_points)
         _skw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             _skw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        self._scalar_two = ttnn.from_torch(torch.full((1, 1, 1), 2.0), **_skw)
-        self._scalar_one = ttnn.from_torch(torch.full((1, 1, 1), 1.0), **_skw)
         self._scalar_half = ttnn.from_torch(torch.full((1, 1, 1), 0.5), **_skw)
+        self._scalar_one = ttnn.from_torch(torch.full((1, 1, 1), 1.0), **_skw)
+        self._scalar_two = ttnn.from_torch(torch.full((1, 1, 1), 2.0), **_skw)
 
         # --- Move all parameters to TT device ---
         # Note: PyTorch nn.Linear stores weight as [out, in],
@@ -121,6 +169,12 @@ class DeformableFeatureAggregation:
             parameters["output_proj_bias"]
         )  # [1,1,1,256]
 
+        # CCL helper for mesh combine
+        if self._mesh_device is not None:
+            from models.common.modules.tt_ccl import TT_CCL
+
+            self._tt_ccl = TT_CCL(self._mesh_device)
+
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move weight tensor to device in TILE layout."""
         if tensor.dim() == 1:
@@ -148,6 +202,9 @@ class DeformableFeatureAggregation:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
         return ttnn.from_torch(tensor.float(), **kwargs)
 
+
+    # === Fallback methods (pure ttnn ops, no custom kernels) ===
+
     def _kps_generator(
         self,
         anchor: ttnn.Tensor,
@@ -166,13 +223,11 @@ class DeformableFeatureAggregation:
         """
         # Extract size [W, L, H] and compute exp
         # anchor [..., 3:6] -> size
-        logger.debug(f"_kps_generator: slice+exp, anchor shape={anchor.shape}")
         size_wlh = ttnn.slice(
             anchor, [0, 0, W], [bs, num_anchor, H + 1]
         )  # [bs, num_anchor, 3]
         size = ttnn.exp(size_wlh)  # [bs, num_anchor, 3]
         ttnn.deallocate(size_wlh)
-        logger.debug("_kps_generator: slice+exp done")
 
         # Reshape size for broadcasting: [bs*num_anchor, 1, 3]
         size_3d = ttnn.reshape(size, (bs * num_anchor, 1, 3))
@@ -180,7 +235,6 @@ class DeformableFeatureAggregation:
         # Fixed key points: fix_scale [7, 3] * size [bs*num_anchor, 1, 3]
         fix_scale_3d = ttnn.reshape(self.fix_scale, (1, 7, 3))
         fix_kps = ttnn.multiply(fix_scale_3d, size_3d)  # [bs*num_anchor, 7, 3]
-        logger.debug("_kps_generator: fix_kps done")
 
         # Learnable key points
         inst_flat = ttnn.reshape(
@@ -190,7 +244,6 @@ class DeformableFeatureAggregation:
             inst_flat, self.learnable_fc_weight, bias=self.learnable_fc_bias,
             compute_kernel_config=self._hifi_compute_config,
         )  # [1, 1, bs*num_anchor, 18]
-        logger.debug("_kps_generator: learnable linear done")
 
         learnable = ttnn.reshape(
             learnable, (bs * num_anchor, self.num_learnable_pts, 3)
@@ -200,50 +253,38 @@ class DeformableFeatureAggregation:
         learnable_kps = ttnn.multiply(learnable, size_3d)  # [bs*num_anchor, 6, 3]
         ttnn.deallocate(learnable)
         # Note: size_3d is a reshape (view) of size, don't deallocate separately
-        logger.debug("_kps_generator: learnable_kps done")
 
         # Concat fixed + learnable: [bs*num_anchor, 13, 3]
         key_points = ttnn.concat([fix_kps, learnable_kps], dim=1)
         ttnn.deallocate(fix_kps)
         ttnn.deallocate(learnable_kps)
-        logger.debug("_kps_generator: concat done")
 
-        # --- Host fallback for rotation + translation (small tensors, avoids TILE hang) ---
-        if self._mesh_device is not None:
-            _composer = ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)
-            key_points_torch = ttnn.to_torch(key_points, mesh_composer=_composer)[:bs * num_anchor]
-            ttnn.deallocate(key_points)
-            anchor_torch = ttnn.to_torch(anchor, mesh_composer=_composer)[:bs]
-        else:
-            key_points_torch = ttnn.to_torch(key_points)  # [bs*num_anchor, 13, 3]
-            ttnn.deallocate(key_points)
-            anchor_torch = ttnn.to_torch(anchor)  # [bs, num_anchor, 11]
+        # --- Rotation + translation on device ---
+        n = bs * num_anchor
+        anchor_flat = ttnn.reshape(anchor, (n, 1, 11))
 
-        cos_yaw = anchor_torch[:, :, COS_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
-        sin_yaw = anchor_torch[:, :, SIN_YAW].reshape(bs * num_anchor, 1)  # [900, 1]
+        cos_yaw = ttnn.slice(anchor_flat, [0, 0, COS_YAW], [n, 1, COS_YAW + 1])  # [n, 1, 1]
+        sin_yaw = ttnn.slice(anchor_flat, [0, 0, SIN_YAW], [n, 1, SIN_YAW + 1])  # [n, 1, 1]
 
-        kp_x = key_points_torch[:, :, 0]  # [900, 13]
-        kp_y = key_points_torch[:, :, 1]  # [900, 13]
-        kp_z = key_points_torch[:, :, 2]  # [900, 13]
+        kp_x = ttnn.slice(key_points, [0, 0, 0], [n, self.num_pts, 1])  # [n, 13, 1]
+        kp_y = ttnn.slice(key_points, [0, 0, 1], [n, self.num_pts, 2])  # [n, 13, 1]
+        kp_z = ttnn.slice(key_points, [0, 0, 2], [n, self.num_pts, 3])  # [n, 13, 1]
+        ttnn.deallocate(key_points)
 
-        rot_x = cos_yaw * kp_x - sin_yaw * kp_y
-        rot_y = sin_yaw * kp_x + cos_yaw * kp_y
+        rot_x = ttnn.subtract(ttnn.multiply(cos_yaw, kp_x), ttnn.multiply(sin_yaw, kp_y))
+        rot_y = ttnn.add(ttnn.multiply(sin_yaw, kp_x), ttnn.multiply(cos_yaw, kp_y))
+        ttnn.deallocate(kp_x); ttnn.deallocate(kp_y)
 
-        key_points_torch = torch.stack([rot_x, rot_y, kp_z], dim=-1)  # [900, 13, 3]
+        key_points = ttnn.concat([rot_x, rot_y, kp_z], dim=-1)  # [n, 13, 3]
+        ttnn.deallocate(rot_x); ttnn.deallocate(rot_y); ttnn.deallocate(kp_z)
+        ttnn.deallocate(anchor_flat)
 
-        # Translate to anchor center
-        center = anchor_torch[:, :, X:Z + 1].reshape(bs * num_anchor, 1, 3)  # [900, 1, 3]
-        key_points_torch = key_points_torch + center
+        center = ttnn.reshape(anchor, (n, 1, 11))
+        center = ttnn.slice(center, [0, 0, X], [n, 1, Z + 1])  # [n, 1, 3]
+        key_points = ttnn.add(key_points, center)
+        ttnn.deallocate(center)
 
-        # Reshape to [bs, num_anchor*num_pts, 3] and send back to device
-        key_points_torch = key_points_torch.reshape(bs, num_anchor * self.num_pts, 3)
-        # Use float32 for key_points (feeds into projection → grid_sample)
-        _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
-        if self._mesh_device is not None:
-            _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        key_points = ttnn.from_torch(key_points_torch.float(), **_kw_f32)
-        del key_points_torch, anchor_torch
-        logger.debug("_kps_generator: rotation+translate (host) done")
+        key_points = ttnn.reshape(key_points, (bs, n * self.num_pts // bs, 3))
 
         return key_points
 
@@ -257,6 +298,8 @@ class DeformableFeatureAggregation:
     ) -> ttnn.Tensor:
         """Project 3D key points to normalized 2D per camera on device.
 
+        Uses batched matmul across all cameras (no per-camera loop).
+
         Args:
             key_points: [bs, num_anchor*num_pts, 3] on device
             projection_mat: [bs, num_cams, 4, 4] on device
@@ -266,88 +309,53 @@ class DeformableFeatureAggregation:
             points_2d_grid: [bs*num_cams, num_anchor, num_pts, 2] on device
         """
         n_pts_total = num_anchor * self.num_pts
+        nc = self.num_cams
 
         # Append ones for homogeneous: [bs, n_pts_total, 4]
-        # Use float32 for projection (grid_sample requires float32 grid)
         _kw_f32 = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32)
         if self._mesh_device is not None:
             _kw_f32["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+        if key_points.dtype != ttnn.float32:
+            key_points = ttnn.typecast(key_points, ttnn.float32)
         ones = ttnn.from_torch(torch.ones(bs, n_pts_total, 1), **_kw_f32)
         pts_homo = ttnn.concat([key_points, ones], dim=-1)  # [bs, n_pts_total, 4]
 
-        # Per-camera projection via loop (avoid 6D tensor)
-        all_cam_points = []
-        for cam_idx in range(self.num_cams):
-            logger.debug(f"DFA _project_points: cam {cam_idx}/{self.num_cams} start")
-            proj = ttnn.slice(
-                projection_mat,
-                [0, cam_idx, 0, 0],
-                [bs, cam_idx + 1, 4, 4],
-            )
-            proj = ttnn.reshape(proj, (bs, 4, 4))
-
-            proj_t = ttnn.transpose(proj, -2, -1)
-            projected = ttnn.matmul(pts_homo, proj_t, compute_kernel_config=self._hifi_compute_config)
-            ttnn.deallocate(proj)
-            ttnn.deallocate(proj_t)
-            logger.debug(f"DFA _project_points: cam {cam_idx} matmul done")
-
-            xy = ttnn.slice(projected, [0, 0, 0], [bs, n_pts_total, 2])
-            z = ttnn.slice(projected, [0, 0, 2], [bs, n_pts_total, 3])
-            z_clamped = ttnn.clamp(z, min=1e-5)
-            z_recip = ttnn.reciprocal(z_clamped)
-            xy_div = ttnn.multiply(xy, z_recip)
-            ttnn.deallocate(projected)
-            ttnn.deallocate(xy)
-            ttnn.deallocate(z)
-            ttnn.deallocate(z_clamped)
-            ttnn.deallocate(z_recip)
-            logger.debug(f"DFA _project_points: cam {cam_idx} perspective divide done")
-
-            wh = ttnn.slice(image_wh, [0, cam_idx, 0], [bs, cam_idx + 1, 2])
-            wh = ttnn.reshape(wh, (bs, 1, 2))
-            wh_recip = ttnn.reciprocal(wh)
-            ttnn.deallocate(wh)
-            xy_norm = ttnn.multiply(xy_div, wh_recip)
-
-            xy_scaled = ttnn.multiply(xy_norm, self._scalar_two)
-            xy_grid = ttnn.subtract(xy_scaled, self._scalar_one)
-            ttnn.deallocate(xy_div)
-            ttnn.deallocate(wh_recip)
-            ttnn.deallocate(xy_norm)
-            ttnn.deallocate(xy_scaled)
-            logger.debug(f"DFA _project_points: cam {cam_idx} grid done")
-
-            xy_grid = ttnn.reshape(xy_grid, (bs, num_anchor, self.num_pts, 2))
-            all_cam_points.append(xy_grid)
-
-        # Interleave camera results to match PyTorch order:
-        # PyTorch: [b0_c0, b0_c1, ..., b0_c5, b1_c0, ...] (batch varies slowest)
-        # Each cam result: [bs, num_anchor, num_pts, 2]
-        if bs == 1:
-            # Simple case: just concat cameras along dim=0
-            points_2d = ttnn.concat(all_cam_points, dim=0)
-        else:
-            # For bs>1: need to interleave batch and camera dims
-            # Slice per-batch from each camera, then concat in correct order
-            interleaved = []
-            for b in range(bs):
-                for cam_idx in range(self.num_cams):
-                    cam_data = all_cam_points[cam_idx]
-                    b_slice = ttnn.slice(
-                        cam_data,
-                        [b, 0, 0, 0],
-                        [b + 1, num_anchor, self.num_pts, 2],
-                    )
-                    interleaved.append(b_slice)
-            points_2d = ttnn.concat(interleaved, dim=0)
-            for s in interleaved:
-                ttnn.deallocate(s)
-
+        # Batched projection: all cameras in one matmul
+        # Expand pts_homo: [bs, n_pts, 4] → [bs*nc, n_pts, 4]
+        pts_expanded = ttnn.concat([pts_homo] * nc, dim=0)  # [bs*nc, n_pts, 4]
         ttnn.deallocate(pts_homo)
         ttnn.deallocate(ones)
-        for p in all_cam_points:
-            ttnn.deallocate(p)
+
+        # Reshape proj: [bs, nc, 4, 4] → [bs*nc, 4, 4] → transpose → [bs*nc, 4, 4]
+        proj = ttnn.reshape(projection_mat, (bs * nc, 4, 4))
+        proj_t = ttnn.transpose(proj, -2, -1)
+
+        # Batched matmul: [bs*nc, n_pts, 4] × [bs*nc, 4, 4] → [bs*nc, n_pts, 4]
+        projected = ttnn.matmul(pts_expanded, proj_t, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(pts_expanded)
+
+        # Perspective divide (all cameras at once)
+        xy = ttnn.slice(projected, [0, 0, 0], [bs * nc, n_pts_total, 2])
+        z = ttnn.slice(projected, [0, 0, 2], [bs * nc, n_pts_total, 3])
+        ttnn.deallocate(projected)
+        z_clamped = ttnn.clamp(z, min=1e-5)
+        z_recip = ttnn.reciprocal(z_clamped)
+        xy_div = ttnn.multiply(xy, z_recip)
+        ttnn.deallocate(xy); ttnn.deallocate(z); ttnn.deallocate(z_clamped); ttnn.deallocate(z_recip)
+
+        # Grid normalization (all cameras at once)
+        # image_wh: [bs, nc, 2] → [bs*nc, 1, 2]
+        wh = ttnn.reshape(image_wh, (bs * nc, 1, 2))
+        wh_recip = ttnn.reciprocal(wh)
+        xy_norm = ttnn.multiply(xy_div, wh_recip)
+        ttnn.deallocate(xy_div); ttnn.deallocate(wh_recip)
+
+        xy_scaled = ttnn.multiply(xy_norm, self._scalar_two)
+        xy_grid = ttnn.subtract(xy_scaled, self._scalar_one)
+        ttnn.deallocate(xy_norm); ttnn.deallocate(xy_scaled)
+
+        # Reshape to [bs*nc, num_anchor, num_pts, 2]
+        points_2d = ttnn.reshape(xy_grid, (bs * nc, num_anchor, self.num_pts, 2))
 
         return points_2d
 
@@ -497,7 +505,7 @@ class DeformableFeatureAggregation:
             fm = ttnn.to_layout(fm, ttnn.ROW_MAJOR_LAYOUT)
             fm = ttnn.reshape(fm, (n_batch, h, w, self.embed_dims))
 
-            sampled = ttnn.grid_sample_lerp(fm, grid, padding_mode="zeros", align_corners=False)
+            sampled = ttnn.grid_sample(fm, grid, padding_mode="zeros", align_corners=False)
             sampled = ttnn.to_layout(sampled, ttnn.TILE_LAYOUT)
             sampled = ttnn.to_memory_config(sampled, ttnn.DRAM_MEMORY_CONFIG)
             all_level_features.append(sampled)
@@ -639,6 +647,156 @@ class DeformableFeatureAggregation:
 
         return features
 
+
+    def _kps_generator_pre_rotation(self, anchor, instance_feature, bs, num_anchor):
+        """Generate pre-rotation 3D key points for kps_project_fused kernel."""
+        n = bs * num_anchor
+        size_wlh = ttnn.slice(anchor, [0, 0, W], [bs, num_anchor, H + 1])
+        size = ttnn.exp(size_wlh)
+        ttnn.deallocate(size_wlh)
+        size_3d = ttnn.reshape(size, (n, 1, 3))
+        fix_scale_3d = ttnn.reshape(self.fix_scale, (1, 7, 3))
+        fix_kps = ttnn.multiply(fix_scale_3d, size_3d)
+        inst_flat = ttnn.reshape(instance_feature, (1, 1, n, self.embed_dims))
+        learnable = ttnn.linear(
+            inst_flat,
+            self.learnable_fc_weight,
+            bias=self.learnable_fc_bias,
+            compute_kernel_config=self._hifi_compute_config,
+        )
+        learnable = ttnn.reshape(learnable, (n, self.num_learnable_pts, 3))
+        learnable = ttnn.sigmoid(learnable)
+        learnable = ttnn.subtract(learnable, self._scalar_half)
+        learnable_kps = ttnn.multiply(learnable, size_3d)
+        ttnn.deallocate(learnable)
+        key_points = ttnn.concat([fix_kps, learnable_kps], dim=1)
+        ttnn.deallocate(fix_kps)
+        ttnn.deallocate(learnable_kps)
+        key_points = ttnn.to_layout(key_points, ttnn.ROW_MAJOR_LAYOUT)
+        key_points = ttnn.to_memory_config(key_points, ttnn.DRAM_MEMORY_CONFIG)
+        return key_points
+
+    def _camera_encoder(
+        self,
+        projection_mat: ttnn.Tensor,
+        bs: int,
+    ) -> ttnn.Tensor:
+        """Camera encoder on device: Linear→ReLU→LN→Linear→ReLU→LN.
+
+        Args:
+            projection_mat: [bs, num_cams, 4, 4] on device
+
+        Returns:
+            camera_embed: [bs, num_cams, 256] on device (TILE)
+        """
+        # Extract first 3 rows of 4x4: [bs, num_cams, 3, 4] -> [bs, num_cams, 12]
+        cam_input = ttnn.slice(projection_mat, [0, 0, 0, 0], [bs, self.num_cams, 3, 4])
+        cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
+
+        # Linear1+ReLU fused: [bs*num_cams, 12] -> [bs*num_cams, 256]
+        x = ttnn.linear(cam_input, self.cam_linear1_weight, bias=self.cam_linear1_bias,
+                         activation="relu", compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(cam_input)
+        ln_in = x
+        x = ttnn.layer_norm(x, weight=self.cam_ln1_weight, bias=self.cam_ln1_bias,
+                             epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(ln_in)
+
+        # Linear2: [bs*num_cams, 256] -> [bs*num_cams, 256]
+        linear2_in = x
+        x = ttnn.linear(x, self.cam_linear2_weight, bias=self.cam_linear2_bias,
+                         activation="relu", compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(linear2_in)
+        ln_in = x
+        x = ttnn.layer_norm(x, weight=self.cam_ln2_weight, bias=self.cam_ln2_bias,
+                             epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(ln_in)
+
+        # Reshape to [bs, num_cams, 256]
+        x = ttnn.reshape(x, (bs, self.num_cams, self.embed_dims))
+        return x
+
+    def _get_weights(
+        self,
+        instance_feature: ttnn.Tensor,
+        anchor_embed: ttnn.Tensor,
+        projection_mat: ttnn.Tensor,
+        bs: int,
+        num_anchor: int,
+        return_logits: bool = False,
+    ) -> ttnn.Tensor:
+        """Compute attention weights on device.
+
+        Args:
+            instance_feature: [bs, num_anchor, embed_dims] on device
+            anchor_embed: [bs, num_anchor, embed_dims] on device
+            projection_mat: [bs, num_cams, 4, 4] on device
+
+        Returns:
+            weights: [bs*num_anchor, num_cams*num_levels*num_pts, num_groups] on device
+        """
+        feature = ttnn.add(instance_feature, anchor_embed)  # [bs, num_anchor, 256]
+
+        if self.use_camera_embed:
+            # Cache camera_embed per frame (same projection_mat across all 6 DFA calls)
+            if (
+                not hasattr(self, "_cached_camera_embed")
+                or self._cached_camera_embed is None
+            ):
+                self._cached_camera_embed = self._camera_encoder(projection_mat, bs)
+            camera_embed = self._cached_camera_embed
+            feat_exp = ttnn.reshape(feature, (bs, num_anchor, 1, self.embed_dims))
+            cam_exp = ttnn.reshape(
+                camera_embed, (bs, 1, self.num_cams, self.embed_dims)
+            )
+            feature = ttnn.add(feat_exp, cam_exp)
+            # Don't deallocate camera_embed — it's cached for reuse
+            feature = ttnn.reshape(
+                feature, (1, 1, bs * num_anchor * self.num_cams, self.embed_dims)
+            )
+        else:
+            feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
+
+        weights = ttnn.linear(
+            feature,
+            self.weights_fc_weight,
+            bias=self.weights_fc_bias,
+            compute_kernel_config=self._hifi_compute_config,
+        )
+
+        ttnn.deallocate(feature)
+
+        total_clp = self.num_cams * self.num_levels * self.num_pts
+        if self.use_camera_embed:
+            weights = ttnn.reshape(
+                weights,
+                (
+                    1,
+                    1,
+                    bs * num_anchor,
+                    self.num_cams * self.num_levels * self.num_pts * self.num_groups,
+                ),
+            )
+            weights = ttnn.reshape(
+                weights, (bs * num_anchor, total_clp, self.num_groups)
+            )
+        else:
+            weights = ttnn.reshape(
+                weights, (bs * num_anchor, total_clp, self.num_groups)
+            )
+
+        if return_logits:
+            return weights  # pre-softmax logits
+
+        weights = ttnn.softmax(
+            weights,
+            dim=1,
+            numeric_stable=True,
+            compute_kernel_config=self._hifi_compute_config,
+        )
+
+        return weights
+
     def run(
         self,
         instance_feature: ttnn.Tensor,
@@ -651,92 +809,144 @@ class DeformableFeatureAggregation:
         bs: int,
         num_anchor: int,
     ) -> ttnn.Tensor:
-        """Full forward pass of DeformableFeatureAggregation on device.
+        n = bs * num_anchor
+        nc = self.num_cams
 
-        Args:
-            instance_feature: [bs, num_anchor, embed_dims] on device (TILE)
-            anchor: [bs, num_anchor, 11] on device (TILE)
-            anchor_embed: [bs, num_anchor, embed_dims] on device (TILE)
-            feature_maps: List of ttnn.Tensor from FPN [1, 1, N*H*W, C]
-            projection_mat: [bs, num_cams, 4, 4] on device (TILE)
-            image_wh: [bs, num_cams, 2] on device (TILE)
-            spatial_shapes: [(H, W)] per FPN level
-            bs: batch size
-            num_anchor: number of anchors
-
-        Returns:
-            output: [bs, num_anchor, embed_dims] (add) or
-                    [bs, num_anchor, 2*embed_dims] (cat) on device
-        """
-        # 1. Generate 3D key points
-        logger.debug("DFA run: _kps_generator start")
-        key_points = self._kps_generator(anchor, instance_feature, bs, num_anchor)
-        logger.debug("DFA run: _kps_generator done")
-        # [bs, num_anchor*num_pts, 3]
-
-        # 2. Project to 2D per camera
-        logger.debug("DFA run: _project_points start")
-        points_2d = self._project_points(
-            key_points, projection_mat, image_wh, bs, num_anchor
-        )
-        ttnn.deallocate(key_points)
-        # [bs*num_cams, num_anchor, num_pts, 2]
-
-        # 3. Compute attention weights
-        logger.debug("DFA run: _get_weights start")
+        # 1. Start attention weights early (independent of KPS projection)
         weights = self._get_weights(
             instance_feature, anchor_embed, projection_mat, bs, num_anchor
         )
-        logger.debug("DFA run: _get_weights done")
-        # [bs*num_anchor, num_cams*num_levels*num_pts, num_groups]
 
-        # 4+5. Feature sampling (grid_sample_lerp) + fusion
-        logger.debug("DFA run: _feature_sampling start")
-        features = self._feature_sampling(
-            feature_maps, points_2d, spatial_shapes, bs, num_anchor
+        # 2. Pre-rotation key points + fused KPS projection (overlaps with weight compute on device)
+        key_points = self._kps_generator_pre_rotation(
+            anchor, instance_feature, bs, num_anchor
         )
-        logger.debug("DFA run: _feature_sampling done")
-        logger.debug("DFA run: _multi_view_level_fusion start")
-        features = self._multi_view_level_fusion(features, weights, bs, num_anchor)
-        logger.debug("DFA run: _multi_view_level_fusion done")
-        ttnn.deallocate(points_2d)
+        anchor_rm = ttnn.reshape(anchor, (n, 1, 11))
+        anchor_rm = ttnn.to_layout(anchor_rm, ttnn.ROW_MAJOR_LAYOUT)
 
-        # In mesh SPMD mode: each device has partial fusion (3 cams).
-        # Combine via host (all_reduce hangs on N300).
-        if self._mesh_device is not None:
-            logger.debug("DFA run: mesh combine start")
-            composer = ttnn.ConcatMeshToTensor(self._mesh_device, dim=0)
-            partials = ttnn.to_torch(features, mesh_composer=composer).float()
-            combined = partials[:1] + partials[1:]
-            del partials
-            ttnn.deallocate(features)
-            features = ttnn.from_torch(
-                combined, layout=ttnn.TILE_LAYOUT, device=self._mesh_device,
-                dtype=ttnn.bfloat16,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self._mesh_device),
+        if not hasattr(self, "_cached_proj_rm") or self._cached_proj_rm is None:
+            proj_flat = ttnn.reshape(projection_mat, (nc * 4, 4))
+            proj_flat = ttnn.to_layout(proj_flat, ttnn.ROW_MAJOR_LAYOUT)
+            proj_flat = ttnn.to_memory_config(proj_flat, ttnn.DRAM_MEMORY_CONFIG)
+            proj_padded = ttnn.pad(proj_flat, [(0, 0), (0, 28)], 0.0)
+            proj_padded = ttnn.typecast(proj_padded, ttnn.float32)
+            self._cached_proj_rm = ttnn.slice(proj_padded, [0, 0], [nc * 4, 4])
+            ttnn.deallocate(proj_padded)
+            self._cached_proj_rm = ttnn.reshape(self._cached_proj_rm, (nc, 4, 4))
+            self._cached_proj_rm = ttnn.to_memory_config(
+                self._cached_proj_rm, ttnn.DRAM_MEMORY_CONFIG
             )
-            del combined
-            logger.debug("DFA run: mesh combine done")
 
-        logger.debug("DFA run: output_proj start")
+        if not hasattr(self, "_cached_wh_rm") or self._cached_wh_rm is None:
+            wh_flat = ttnn.reshape(image_wh, (nc, 2))
+            wh_flat = ttnn.to_layout(wh_flat, ttnn.ROW_MAJOR_LAYOUT)
+            wh_flat = ttnn.to_memory_config(wh_flat, ttnn.DRAM_MEMORY_CONFIG)
+            wh_padded = ttnn.pad(wh_flat, [(0, 0), (0, 30)], 0.0)
+            wh_padded = ttnn.typecast(wh_padded, ttnn.float32)
+            self._cached_wh_rm = ttnn.slice(wh_padded, [0, 0], [nc, 2])
+            ttnn.deallocate(wh_padded)
+            self._cached_wh_rm = ttnn.reshape(self._cached_wh_rm, (nc, 1, 2))
+            self._cached_wh_rm = ttnn.to_memory_config(
+                self._cached_wh_rm, ttnn.DRAM_MEMORY_CONFIG
+            )
+
+        if _HAS_CUSTOM_KERNELS:
+            # === Fast path: custom kernels ===
+            points_2d = ttnn.kps_project_fused(
+                key_points, anchor_rm,
+                self._cached_proj_rm, self._cached_wh_rm,
+                num_cams=nc, num_pts=self.num_pts,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            ttnn.deallocate(key_points)
+            ttnn.deallocate(anchor_rm)
+
+            points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
+            ttnn.deallocate(points_2d)
+
+            weights_t = ttnn.transpose(weights, 0, 1)
+
+            total_clp = nc * self.num_levels * self.num_pts
+            if not hasattr(self, '_rearrange_buf') or self._rearrange_buf is None:
+                _buf = torch.zeros(total_clp, n, self.embed_dims, dtype=torch.bfloat16)
+                _kw = dict(dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+                if self._mesh_device is not None:
+                    _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                self._rearrange_buf = ttnn.from_torch(_buf, **_kw)
+
+            for level_idx, fm_tt in enumerate(feature_maps):
+                sampled = ttnn.grid_sample(
+                    fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False
+                )
+                ttnn.transposed_s2i(
+                    sampled, self._rearrange_buf,
+                    num_cams=nc, num_pts=self.num_pts, num_anchors=n,
+                    num_levels=self.num_levels, level=level_idx,
+                )
+            ttnn.deallocate(points_2d_sh)
+
+            features = ttnn.to_layout(self._rearrange_buf, ttnn.TILE_LAYOUT)
+            gws_out = ttnn.grouped_weighted_sum(
+                features, weights_t, num_groups=self.num_groups, group_dims=self.group_dims
+            )
+            ttnn.deallocate(weights_t)
+            ttnn.deallocate(features)
+            n_padded = ((n + 31) // 32) * 32
+            chunk0 = ttnn.slice(gws_out, [0, 0], [n, self.embed_dims])
+            chunk1 = ttnn.slice(gws_out, [n_padded, 0], [n_padded + n, self.embed_dims])
+            ttnn.deallocate(gws_out)
+            features = ttnn.add(chunk0, chunk1)
+            ttnn.deallocate(chunk0)
+            ttnn.deallocate(chunk1)
+        else:
+            # === Fallback path: original pure ttnn ops (from pre-kernel commit bc5e388) ===
+            ttnn.deallocate(anchor_rm)
+
+            # 1. KPS generator (device-side rotation + translation)
+            key_points_full = self._kps_generator(anchor, instance_feature, bs, num_anchor)
+
+            # 2. Project to 2D per camera (device-side batched matmul)
+            points_2d = self._project_points(
+                key_points_full, projection_mat, image_wh, bs, num_anchor
+            )
+            ttnn.deallocate(key_points_full)
+            ttnn.deallocate(key_points)
+
+            # 3. Feature sampling (grid_sample per level + rearrange)
+            features = self._feature_sampling(
+                feature_maps, points_2d, spatial_shapes, bs, num_anchor
+            )
+
+            # 4. Weighted fusion (repeat_interleave + multiply + sum)
+            features = self._multi_view_level_fusion(features, weights, bs, num_anchor)
+        features = ttnn.reshape(features, (1, 1, n, self.embed_dims))
+
+        # 6. Mesh combine via CCL (features already in DRAM from add)
+        if self._mesh_device is not None:
+            features = ttnn.all_reduce(
+                features,
+                num_links=1,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=ttnn.Topology.Linear,
+            )
+
+        # 7. Output projection + residual
         output = ttnn.linear(
-            features, self.output_proj_weight, bias=self.output_proj_bias,
+            features,
+            self.output_proj_weight,
+            bias=self.output_proj_bias,
             compute_kernel_config=self._hifi_compute_config,
         )
         ttnn.deallocate(features)
-        logger.debug("DFA run: output_proj done")
-
-        logger.debug("DFA run: residual start")
-        inst_flat = ttnn.reshape(
-            instance_feature, (1, 1, bs * num_anchor, self.embed_dims)
-        )
+        inst_flat = ttnn.reshape(instance_feature, (1, 1, n, self.embed_dims))
+        if output.dtype != inst_flat.dtype:
+            output = ttnn.typecast(output, inst_flat.dtype)
         if self.residual_mode == "add":
             output = ttnn.add(output, inst_flat)
             output = ttnn.reshape(output, (bs, num_anchor, self.embed_dims))
         elif self.residual_mode == "cat":
             output = ttnn.concat([output, inst_flat], dim=-1)
             output = ttnn.reshape(output, (bs, num_anchor, 2 * self.embed_dims))
-        logger.debug("DFA run: residual done")
 
         return output
 

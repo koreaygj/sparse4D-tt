@@ -14,6 +14,37 @@ Porting the Sparse4D v3 3D object detection model to Tenstorrent devices (Wormho
 | Baseline Performance | NDS 0.5637, mAP 0.4647 (ResNet50) |
 
 
+## Performance
+
+### Speed
+
+|  | PyTorch  | TT-NN Pure (N300) | TT-NN + Custom Kernels (N300) |
+| :--- | :---: | :---: | :---: |
+| **Latency** | ~95ms | 235ms | **122ms** |
+| **FPS** | 10.5 | 4.2 | **8.2** |
+
+- **Pure TT-NN**: Standard ttnn ops only, no custom kernel build required. Automatically used as fallback when custom kernels are not built.
+- **Custom Kernels** (recommended): 3 custom Metalium kernels (`kps_project_fused`, `transposed_s2i`, `grouped_weighted_sum`) for 1.9x speedup — see [docs/INSTALL.md](docs/INSTALL.md)
+
+### Accuracy
+
+Sparse4D-TT currently exhibits a 0.06 mAP drop compared to the FP32 baseline, primarily due to BF16 precision constraints on the Wormhole N300 accelerator.
+
+|  | PyTorch (CUDA) | TT-NN (N300) | Gap |
+| :--- | :---: | :---: | :---: |
+| **mAP** | 0.4529 | **0.3898** | -0.0631 |
+| **NDS** | 0.5602 | **0.5150** | -0.0452 |
+| **mATE** | 0.5455 | **0.6235** | +0.0780 |
+| **mASE** | 0.2622 | **0.2694** | +0.0072 |
+| **mAOE** | 0.4373 | **0.4589** | +0.0216 |
+| **mAVE** | 0.2195 | **0.2687** | +0.0492 |
+| **mAAE** | 0.1987 | **0.1784** | -0.0203 |
+
+### Inference video
+
+https://github.com/user-attachments/assets/3752d051-9e4a-4a9d-9410-eec0bdcb3027
+
+
 ## Setup
 
 ### Requirements
@@ -35,38 +66,51 @@ git clone <repository-url>
 cd project
 
 # 3. Install dependencies
-pip install -r Sparse4D/requirement.txt
+pip install -r Sparse4D-tt/requirement.txt
 ```
+
+### tt-metal Custom Kernel Build
+
+This project uses 3 custom TT-Metal kernels (`kps_project_fused`, `grouped_weighted_sum`, `transposed_s2i`) that must be built into the tt-metal library.
+
+See **[docs/INSTALL.md](docs/INSTALL.md)** for detailed build instructions.
 
 ### Running
 
 **nuScenes Val Evaluation**
 
 ```bash
-# TT-NN inference (dual-device, full val set)
+# TT-NN inference (dual-device mesh, full val set)
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmpi_cxx.so.40.30.1:/usr/lib/x86_64-linux-gnu/libmpi.so.40
 TT_METAL_LOGGER_LEVEL=ERROR python test/sparse4d_nuscenes_val.py \
   --data-root /path/to/nuscenes/trainval \
   --dual-device
 
 # With options
-python test/sparse4d_nuscenes_val.py \
+TT_METAL_LOGGER_LEVEL=ERROR python test/sparse4d_nuscenes_val.py \
   --data-root /path/to/nuscenes/trainval \
   --dual-device \
-  --num-samples 100 \          # quick test (default: all 6019)
-  --bf16 \                     # use BF16 QAT checkpoint
-  --fidelity hifi4 \           # override math fidelity (lofi/hifi2/hifi4)
-  --grid-sample-lerp           # use grid_sample_lerp instead of grid_sample
+  --num-sample 100 \           # quick test (default: all 6019)
+  --bf16 \                     # use BF16 checkpoint (ckpt/bf16_latest.pth)
+  --fidelity hifi4             # override math fidelity (lofi/hifi2/hifi4)
 
 # PyTorch baseline (for comparison)
 cd Sparse4D
+conda activate sparse4d
 python nuscenes_val.py --data-root /path/to/nuscenes/trainval
+```
+
+**Inference Speed Profiling**
+
+```bash
+TT_METAL_LOGGER_LEVEL=ERROR python debug/profile_inference.py
 ```
 
 **Inference Video**
 
 ```bash
 # Generate detection video from nuScenes samples
-TT_METAL_LOGGER_LEVEL=ERROR python run_inference_video.py \
+TT_METAL_LOGGER_LEVEL=ERROR python tools/run_inference_video.py \
   --data-root /path/to/nuscenes/trainval \
   --dual-device \
   --frames 80 \
@@ -74,28 +118,11 @@ TT_METAL_LOGGER_LEVEL=ERROR python run_inference_video.py \
   --output inference_video_tt.mp4
 
 # FPS benchmark mode (no video output)
-python run_inference_video.py --dual-device --mode fps --frames 50
+TT_METAL_LOGGER_LEVEL=ERROR python tools/run_inference_video.py \
+  --dual-device --mode fps --frames 50
 ```
 
-## Compare with PyTorch
-
-### matrics
-
-|           | **PyTorch (CUDA)** | **TT-NN (N300)** | **Gap** |
-| --------- | ------------------ | ---------------- | ------- |
-| **mAP**   | 0.4529             | 0.3975           | -0.055  |
-| **NDS**   | 0.5602             | 0.5179           | -0.042  |
-| mATE      | 0.5455             | 0.6196           | +0.074  |
-| mASE      | 0.2622             | 0.2693           | +0.007  |
-| mAOE      | 0.4373             | 0.4777           | +0.040  |
-| mAVE      | 0.2195             | 0.2658           | +0.046  |
-| mAAE      | 0.1987             | 0.1765           | -0.022  |
-| **Speed** | ~120ms (A100)      | **330ms**        | -       |
-
-
-### Inference video
-
-https://github.com/user-attachments/assets/3752d051-9e4a-4a9d-9410-eec0bdcb3027
+> **Note**: `LD_PRELOAD` is required for mesh CCL (all_reduce) on some systems. If you get Ethernet timeout errors, run `tt-smi -r 0,1` to reset devices.
 
 ## References
 

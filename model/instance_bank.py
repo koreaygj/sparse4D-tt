@@ -61,6 +61,12 @@ class InstanceBank:
         self.anchor_data = anchor_data.float()  # [num_anchor, 11] on host
         self.instance_feature_data = instance_feature_data.float()  # [num_anchor, embed_dims]
 
+        # Pre-cache constant anchor/feature on device (avoid repeated host→device upload)
+        anchor_tiled = anchor_data.float().unsqueeze(0).contiguous()  # [1, num_anchor, 11]
+        feature_tiled = instance_feature_data.float().unsqueeze(0).contiguous()  # [1, num_anchor, embed_dims]
+        self._dev_anchor = self._to_dev(anchor_tiled)
+        self._dev_feature = self._to_dev(feature_tiled)
+
         self.reset()
 
     def _to_dev(self, tensor: torch.Tensor) -> ttnn.Tensor:
@@ -100,9 +106,7 @@ class InstanceBank:
             cached_anchor: [bs, num_temp, 11] on device or None
             time_interval: [bs] on device
         """
-        # Tile anchor and feature across batch
-        anchor_tiled = self.anchor_data.unsqueeze(0).expand(bs, -1, -1).contiguous()
-        feature_tiled = self.instance_feature_data.unsqueeze(0).expand(bs, -1, -1).contiguous()
+        # Use pre-cached device tensors (no host→device upload needed)
 
         cached_feature = None
         cached_anchor = None
@@ -113,29 +117,57 @@ class InstanceBank:
             time_interval_pt = metas["timestamp"] - history_time
             self.mask = torch.abs(time_interval_pt) <= self.max_time_interval
 
-            # Anchor projection: transform cached anchors to current frame
-            # Done on host since it requires numpy metas (T_global matrices)
-            cached_anchor_pt = self._from_dev(self.cached_anchor)
-            T_temp2cur = torch.tensor(
+            # Anchor projection: device-side (PCC 0.999994)
+            T_temp2cur_pt = torch.tensor(
                 np.stack([
                     x["T_global_inv"] @ self.metas["img_metas"][i]["T_global"]
                     for i, x in enumerate(metas["img_metas"])
                 ]),
                 dtype=torch.float32,
-            )
-            cached_anchor_pt = self._anchor_projection(
-                cached_anchor_pt, T_temp2cur, -time_interval_pt
-            )
+            ).bfloat16()
 
-            # Fix time_interval: use default where mask is False or interval is 0
+            _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+            if self._mesh_device is not None:
+                _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+
+            anc = self.cached_anchor
+            nt = anc.shape[1]
+            neg_ti_bf = (-time_interval_pt).reshape(bs, 1, 1).bfloat16()
+            ti_tt = ttnn.from_torch(neg_ti_bf, **_kw)
+            vel = ttnn.slice(anc, [0, 0, VX], [bs, nt, VZ + 1])
+            center = ttnn.slice(anc, [0, 0, X], [bs, nt, Z + 1])
+            translation = ttnn.multiply(vel, ti_tt)
+            center = ttnn.subtract(center, translation)
+            ttnn.deallocate(translation); ttnn.deallocate(ti_tt)
+
+            R33_T_pt = T_temp2cur_pt[:,:3,:3].transpose(-1,-2).contiguous()
+            R33_T = ttnn.from_torch(R33_T_pt, **_kw)
+            t3 = ttnn.from_torch(T_temp2cur_pt[:,:3,3].reshape(bs,1,3).contiguous(), **_kw)
+            center = ttnn.matmul(center, R33_T)
+            center = ttnn.add(center, t3); ttnn.deallocate(t3)
+
+            cos_yaw = ttnn.slice(anc, [0,0,COS_YAW], [bs,nt,COS_YAW+1])
+            sin_yaw = ttnn.slice(anc, [0,0,SIN_YAW], [bs,nt,SIN_YAW+1])
+            yaw_cs = ttnn.concat([cos_yaw, sin_yaw], dim=-1)
+            ttnn.deallocate(cos_yaw); ttnn.deallocate(sin_yaw)
+            R22_T = ttnn.from_torch(T_temp2cur_pt[:,:2,:2].transpose(-1,-2).contiguous(), **_kw)
+            yaw_out = ttnn.matmul(yaw_cs, R22_T); ttnn.deallocate(yaw_cs)
+
+            # Reuse R33_T for velocity rotation (same matrix, was uploaded twice before)
+            vel_out = ttnn.matmul(vel, R33_T)
+            ttnn.deallocate(vel); ttnn.deallocate(R33_T); ttnn.deallocate(R22_T)
+
+            size = ttnn.slice(anc, [0,0,W], [bs,nt,H+1])
+            cached_anchor = ttnn.concat([center, size, yaw_out, vel_out], dim=-1)
+            ttnn.deallocate(center); ttnn.deallocate(size)
+            ttnn.deallocate(yaw_out); ttnn.deallocate(vel_out)
+            self.cached_anchor = cached_anchor
+
             time_interval_pt = torch.where(
                 torch.logical_and(time_interval_pt != 0, self.mask),
                 time_interval_pt,
                 torch.tensor(self.default_time_interval, dtype=time_interval_pt.dtype),
             )
-
-            cached_anchor = self._to_dev(cached_anchor_pt)
-            self.cached_anchor = cached_anchor  # update for update() to use projected version
             cached_feature = self.cached_feature  # already on device
         else:
             self.reset()
@@ -143,9 +175,9 @@ class InstanceBank:
                 (bs,), self.default_time_interval, dtype=torch.float32
             )
 
-        # Move to device
-        instance_feature = self._to_dev(feature_tiled)
-        anchor = self._to_dev(anchor_tiled)
+        # Use pre-cached device tensors (no host→device upload for constant data)
+        instance_feature = self._dev_feature
+        anchor = self._dev_anchor
         time_interval = self._to_dev(time_interval_pt.reshape(1, 1, 1, bs))
         time_interval = ttnn.reshape(time_interval, (bs,))
 
@@ -175,40 +207,43 @@ class InstanceBank:
 
         N = self.num_anchor - self.num_temp_instances  # 300
 
-        # confidence max over classes: [bs, num_anchor, num_cls] → [bs, num_anchor]
-        conf_pt = self._from_dev(confidence)
-        conf_max = conf_pt.max(dim=-1).values  # [bs, num_anchor]
+        # Device-side topk (no host roundtrip)
+        conf_max = ttnn.max(confidence, dim=-1, keepdim=True)
+        conf_max_2d = ttnn.reshape(conf_max, (bs, self.num_anchor))
+        ttnn.deallocate(conf_max)
+        _, top_idx_flat = ttnn.topk(conf_max_2d, N, dim=-1)
+        ttnn.deallocate(conf_max_2d)
+        top_idx_flat = ttnn.typecast(top_idx_flat, ttnn.uint32)
+        top_idx = ttnn.reshape(top_idx_flat, (bs, N, 1))
+        top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(top_idx_flat)
 
-        # topk: select top-N by confidence
-        _, top_indices = torch.topk(conf_max, N, dim=1)  # [bs, N]
+        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+        selected_feature = ttnn.gather(instance_feature, 1, idx_feat)
+        ttnn.deallocate(idx_feat)
 
-        # Gather selected features and anchors on host
-        inst_pt = self._from_dev(instance_feature)
-        anch_pt = self._from_dev(anchor)
+        anch_dim = anchor.shape[-1]
+        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+        selected_anchor = ttnn.gather(anchor, 1, idx_anch)
+        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
-        selected_feature = torch.gather(
-            inst_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, self.embed_dims),
-        )
-        selected_anchor = torch.gather(
-            anch_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, anch_pt.shape[-1]),
-        )
+        # Device concat
+        merged_feature = ttnn.concat([self.cached_feature, selected_feature], dim=1)
+        merged_anchor = ttnn.concat([self.cached_anchor, selected_anchor], dim=1)
+        ttnn.deallocate(selected_feature); ttnn.deallocate(selected_anchor)
 
-        # Concat cached + selected
-        cached_feat_pt = self._from_dev(self.cached_feature)
-        cached_anch_pt = self._from_dev(self.cached_anchor)
-        merged_feature = torch.cat([cached_feat_pt, selected_feature], dim=1)
-        merged_anchor = torch.cat([cached_anch_pt, selected_anchor], dim=1)
-
-        # Apply mask: use merged where mask=True, keep original where mask=False
-        mask = self.mask[:, None, None]  # [bs, 1, 1]
-        out_feature = torch.where(mask, merged_feature, inst_pt)
-        out_anchor = torch.where(mask, merged_anchor, anch_pt)
-
-        # Back to device
-        instance_feature = self._to_dev(out_feature)
-        anchor = self._to_dev(out_anchor)
+        if self.mask.all():
+            instance_feature = merged_feature
+            anchor = merged_anchor
+        else:
+            inst_pt = self._from_dev(instance_feature)
+            anch_pt = self._from_dev(anchor)
+            merged_f_pt = self._from_dev(merged_feature)
+            merged_a_pt = self._from_dev(merged_anchor)
+            mask_t = self.mask[:, None, None]
+            instance_feature = self._to_dev(torch.where(mask_t, merged_f_pt, inst_pt))
+            anchor = self._to_dev(torch.where(mask_t, merged_a_pt, anch_pt))
+            ttnn.deallocate(merged_feature); ttnn.deallocate(merged_anchor)
 
         return instance_feature, anchor
 
@@ -234,40 +269,54 @@ class InstanceBank:
 
         self.metas = metas
 
-        # confidence: max over classes → sigmoid
-        conf_pt = self._from_dev(confidence)
-        conf_scores = conf_pt.max(dim=-1).values.sigmoid()  # [bs, num_anchor]
+        # confidence: max over classes → sigmoid (device-side)
+        conf_max = ttnn.max(confidence, dim=-1, keepdim=True)  # [bs, num_anchor, 1]
+        conf_max = ttnn.reshape(conf_max, (bs, self.num_anchor))
+        conf_scores = ttnn.sigmoid(conf_max)  # [bs, num_anchor]
+        ttnn.deallocate(conf_max)
 
-        # Apply confidence decay to previously cached instances
+        # Apply confidence decay to previously cached instances (device-side)
         if self.confidence is not None:
-            prev_conf = self._from_dev(self.confidence).squeeze()
-            if prev_conf.dim() == 1:
-                prev_conf = prev_conf.unsqueeze(0)
-            decayed = prev_conf * self.confidence_decay
-            conf_scores[:, :self.num_temp_instances] = torch.maximum(
-                decayed, conf_scores[:, :self.num_temp_instances]
-            )
+            prev_conf = ttnn.reshape(self.confidence, (bs, self.num_temp_instances))
+            _kw_sc = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+            if self._mesh_device is not None:
+                _kw_sc["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            decay_scalar = ttnn.from_torch(
+                torch.full((1, 1), self.confidence_decay), **_kw_sc)
+            decayed = ttnn.multiply(prev_conf, decay_scalar)
+            # Slice first num_temp from conf_scores, max with decayed, replace
+            conf_temp = ttnn.slice(conf_scores, [0, 0], [bs, self.num_temp_instances])
+            conf_temp = ttnn.maximum(decayed, conf_temp)
+            ttnn.deallocate(decayed)
+            # Reconstruct: [decayed_temp | rest]
+            if self.num_temp_instances < self.num_anchor:
+                conf_rest = ttnn.slice(conf_scores, [0, self.num_temp_instances],
+                                        [bs, self.num_anchor])
+                conf_scores = ttnn.concat([conf_temp, conf_rest], dim=-1)
+                ttnn.deallocate(conf_rest)
+            else:
+                conf_scores = conf_temp
+            ttnn.deallocate(conf_temp)
 
-        # topk: select top num_temp_instances
-        top_conf, top_indices = torch.topk(
-            conf_scores, self.num_temp_instances, dim=1
-        )
+        # Device topk + gather
+        K = self.num_temp_instances
+        top_conf, top_idx_flat = ttnn.topk(conf_scores, K, dim=-1)
+        ttnn.deallocate(conf_scores)
+        top_idx_flat = ttnn.typecast(top_idx_flat, ttnn.uint32)
+        top_idx = ttnn.reshape(top_idx_flat, (bs, K, 1))
+        top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(top_idx_flat)
 
-        inst_pt = self._from_dev(instance_feature)
-        anch_pt = self._from_dev(anchor)
+        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+        self.cached_feature = ttnn.gather(instance_feature, 1, idx_feat)
+        ttnn.deallocate(idx_feat)
 
-        cached_feature = torch.gather(
-            inst_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, self.embed_dims),
-        )
-        cached_anchor = torch.gather(
-            anch_pt, 1,
-            top_indices.unsqueeze(-1).expand(-1, -1, anch_pt.shape[-1]),
-        )
+        anch_dim = anchor.shape[-1]
+        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+        self.cached_anchor = ttnn.gather(anchor, 1, idx_anch)
+        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
-        self.cached_feature = self._to_dev(cached_feature)
-        self.cached_anchor = self._to_dev(cached_anchor)
-        self.confidence = self._to_dev(top_conf.reshape(1, 1, bs, self.num_temp_instances))
+        self.confidence = ttnn.reshape(top_conf, (1, 1, bs, K))
 
     @staticmethod
     def _anchor_projection(
