@@ -26,6 +26,7 @@ TT_METAL_HOME = os.environ.get(
 )
 sys.path.insert(0, TT_METAL_HOME)
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from test.sparse4d_nuscenes_val import (
     CLASS_NAMES,
@@ -284,7 +285,8 @@ def main():
 
     if args.dual_device and num_devices >= 2:
         print(f"  {num_devices} chips detected, opening mesh (1x2)...")
-        mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=24576)
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), l1_small_size=32768)
         device = mesh_device
         print(f"  Mesh device IDs: {mesh_device.get_device_ids()}")
 
