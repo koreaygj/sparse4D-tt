@@ -52,7 +52,7 @@ class MultiheadAttention:
         self.head_dim = embed_dims // num_heads
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
 
         # Q, K, V projection weights (already transposed: [in, out] for ttnn.linear)

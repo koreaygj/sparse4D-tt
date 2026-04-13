@@ -51,7 +51,7 @@ class SparseBox3DRefinementModule:
         self.embed_dims = embed_dims
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
         self.output_dim = output_dim
         self.num_cls = num_cls
