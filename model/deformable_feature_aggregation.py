@@ -64,7 +64,7 @@ class DeformableFeatureAggregation:
             math_fidelity=ttnn.MathFidelity.HiFi2,
             fp32_dest_acc_en=False,
             packer_l1_acc=False,
-            math_approx_mode=True,
+            math_approx_mode=False,
         )
 
         # Weight CLP reorder index: camera-major → level-major
@@ -400,20 +400,18 @@ class DeformableFeatureAggregation:
             num_cams=nc,
             num_pts=self.num_pts,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            precompute_grid=True,
-            spatial_shapes=[(h, w) for h, w in spatial_shapes],
         )
         ttnn.deallocate(key_points)
         ttnn.deallocate(anchor_rm)
 
-        # Precomputed output: [nc*NL, N, 1, pts*6] camera-major
-        # Layout: [cam0_L0, cam0_L1, cam0_L2, cam0_L3, cam1_L0, ...]
-        pts6 = points_2d.shape[-1]
+        # L1 HEIGHT_SHARDED grid → faster grid_sample (grid in local L1)
+        points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
+        ttnn.deallocate(points_2d)
 
         # 3. Start weight transpose early (overlaps with grid_sample on device)
         weights_t = ttnn.transpose(weights, 0, 1)
 
-        # 4. Grid sample with precomputed grids + transposed s2i
+        # 4. Grid sample + transposed s2i (fused concat + transpose)
         total_clp = nc * self.num_levels * self.num_pts
         if not hasattr(self, '_rearrange_buf') or self._rearrange_buf is None:
             _buf = torch.zeros(total_clp, n, self.embed_dims, dtype=torch.bfloat16)
@@ -423,36 +421,15 @@ class DeformableFeatureAggregation:
             self._rearrange_buf = ttnn.from_torch(_buf, **_kw)
 
         for level_idx, fm_tt in enumerate(feature_maps):
-            # Extract per-level precomputed grid from camera-major output
-            # Camera-major: row c*NL+l = camera c, level l
-            # Gather per-camera slices and concat to get [nc, N, 1, pts*6]
-            cam_grids = []
-            for c in range(nc):
-                row = c * self.num_levels + level_idx
-                cam_grid = ttnn.slice(
-                    points_2d,
-                    [row, 0, 0, 0],
-                    [row + 1, n, 1, pts6],
-                )
-                cam_grids.append(cam_grid)
-            level_grid = ttnn.concat(cam_grids, dim=0)
-            for cg in cam_grids:
-                ttnn.deallocate(cg)
-            # L1 shard the precomputed grid
-            level_grid_sh = ttnn.to_memory_config(level_grid, self._grid_precomputed_sharded_mem)
-            ttnn.deallocate(level_grid)
             sampled = ttnn.grid_sample(
-                fm_tt, level_grid_sh, padding_mode="zeros", align_corners=False,
-                use_precomputed_grid=True,
+                fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False
             )
-            ttnn.deallocate(level_grid_sh)
-            # Transposed s2i: write L1 sharded → DRAM [CLP, N, C] in camera-major order
             ttnn.transposed_s2i(
                 sampled, self._rearrange_buf,
                 num_cams=nc, num_pts=self.num_pts, num_anchors=n,
                 num_levels=self.num_levels, level=level_idx,
             )
-        ttnn.deallocate(points_2d)
+        ttnn.deallocate(points_2d_sh)
 
         # 5. Tilize + GWS
         features = ttnn.to_layout(self._rearrange_buf, ttnn.TILE_LAYOUT)
