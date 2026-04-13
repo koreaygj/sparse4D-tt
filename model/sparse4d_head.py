@@ -21,7 +21,6 @@
 
 import torch
 import ttnn
-from loguru import logger
 
 from model.multihead_attention import MultiheadAttention, preprocess_mha_parameters
 from model.asymmetric_ffn import AsymmetricFFN, preprocess_ffn_parameters
@@ -74,7 +73,7 @@ class Sparse4DHead:
         self.embed_dims = embed_dims
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
         )
         self.num_decoder = num_decoder
         self.num_single_frame_decoder = num_single_frame_decoder
@@ -195,7 +194,6 @@ class Sparse4DHead:
                     model_config={},
                     mesh_device=mesh_device,
                 )
-        logger.info(f"Mesh DFA: {len(self._mesh_dfa_runners)} runners on 2 submeshes")
 
     def _to_device(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -263,10 +261,8 @@ class Sparse4DHead:
     def _norm(self, layer_idx: int, x: ttnn.Tensor, bs: int, num_tokens: int):
         """LayerNorm on device."""
         norm = self.layers[layer_idx]
-        x_flat = ttnn.reshape(x, (1, 1, bs * num_tokens, self.embed_dims))
-        normed = ttnn.layer_norm(x_flat, weight=norm["weight"], bias=norm["bias"],
-                                  epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
-        return ttnn.reshape(normed, (bs, num_tokens, self.embed_dims))
+        return ttnn.layer_norm(x, weight=norm["weight"], bias=norm["bias"],
+                               epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
 
     def forward(
         self,
@@ -295,6 +291,7 @@ class Sparse4DHead:
                 self.layers[i]._cached_camera_embed = None
                 self.layers[i]._host_proj = None
                 self.layers[i]._host_wh = None
+                self.layers[i]._cached_proj_rm = None  # proj changes per frame
 
         # 1. InstanceBank.get()
         (
@@ -355,9 +352,6 @@ class Sparse4DHead:
         quality = []
 
         for i, op in enumerate(self.operation_order):
-            logger.debug(f"Head decoder: op[{i}]={op} start, inst_feat dtype={instance_feature.dtype}")
-            logger.debug(f"Head decoder: op[{i}]={op} sync start")
-            logger.debug(f"Head decoder: op[{i}]={op} sync done")
 
             if self.layers[i] is None:
                 continue
@@ -426,12 +420,10 @@ class Sparse4DHead:
                     len(prediction) == self.num_single_frame_decoder - 1
                     or i == len(self.operation_order) - 1
                 )
-                logger.debug(f"Head refine[{i}]: refine.run start, return_cls={return_cls}")
                 anchor, cls, qt = refine.run(
                     instance_feature, anchor, anchor_embed, time_interval,
                     bs=bs, num_anchor=num_anchor, return_cls=return_cls,
                 )
-                logger.debug(f"Head refine[{i}]: refine.run done")
                 prediction.append(anchor)
                 classification.append(cls)
                 quality.append(qt)
@@ -439,7 +431,6 @@ class Sparse4DHead:
                 # After single-frame decoder: update instances
                 if len(prediction) == self.num_single_frame_decoder:
                     if cls is not None:
-                        logger.debug(f"Head refine[{i}]: instance_bank.update start")
                         old_instance_feature = instance_feature
                         instance_feature, anchor = self.instance_bank.update(
                             instance_feature, anchor, cls, bs=bs,
@@ -447,17 +438,14 @@ class Sparse4DHead:
                         # Only deallocate if update created a new tensor
                         if instance_feature is not old_instance_feature:
                             ttnn.deallocate(old_instance_feature)
-                        logger.debug(f"Head refine[{i}]: instance_bank.update done")
 
                 # Re-encode anchor (except at last step)
                 if i != len(self.operation_order) - 1:
-                    logger.debug(f"Head refine[{i}]: anchor_encoder.run start")
                     old_anchor_embed = anchor_embed
                     anchor_embed = self.anchor_encoder.run(
                         anchor, bs=bs, num_anchor=num_anchor
                     )
                     ttnn.deallocate(old_anchor_embed)
-                    logger.debug(f"Head refine[{i}]: anchor_encoder.run done, anchor_embed={anchor_embed.shape}")
 
                 # Update temp_anchor_embed after single-frame decoder
                 if (
@@ -469,7 +457,6 @@ class Sparse4DHead:
                         [0, 0, 0],
                         [bs, self.num_temp_instances, self.embed_dims],
                     )
-                    logger.debug(f"Head refine[{i}]: temp_anchor_embed updated")
 
             if debug:
                 debug_intermediates[f"step_{i}_{op}"] = ttnn.to_torch(instance_feature)
