@@ -73,7 +73,7 @@ class Sparse4DHead:
         self.embed_dims = embed_dims
         self._hifi_compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2,
-            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=True,
+            fp32_dest_acc_en=False, packer_l1_acc=False, math_approx_mode=False,
         )
         self.num_decoder = num_decoder
         self.num_single_frame_decoder = num_single_frame_decoder
@@ -261,8 +261,10 @@ class Sparse4DHead:
     def _norm(self, layer_idx: int, x: ttnn.Tensor, bs: int, num_tokens: int):
         """LayerNorm on device."""
         norm = self.layers[layer_idx]
-        return ttnn.layer_norm(x, weight=norm["weight"], bias=norm["bias"],
-                               epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
+        x_flat = ttnn.reshape(x, (1, 1, bs * num_tokens, self.embed_dims))
+        normed = ttnn.layer_norm(x_flat, weight=norm["weight"], bias=norm["bias"],
+                                  epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
+        return ttnn.reshape(normed, (bs, num_tokens, self.embed_dims))
 
     def forward(
         self,
