@@ -229,6 +229,7 @@ class Conv2dOp:
         input_width: int,
         groups: int = 1,
         activation=None,
+        weights_dtype=ttnn.bfloat16,
         activation_dtype=ttnn.bfloat16,
         shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
         deallocate_activation: bool = False,
@@ -336,6 +337,7 @@ class Bottleneck:
         downsample_block_sharded: bool = False,
         math_fidelity=ttnn.MathFidelity.LoFi,
         fp32_dest_acc_en: bool = False,
+        weights_dtype=ttnn.bfloat16,
     ):
         self.device = device
         self.has_downsample = has_downsample
