@@ -174,16 +174,16 @@ void kernel_main() {
                     float ky = bf16_to_f32(kp_bf16[bf16_offset + 1]);
                     float kz = bf16_to_f32(kp_bf16[bf16_offset + 2]);
 
-                    float cos_kx = bf16_trunc(cos_yaw * kx);
-                    float sin_ky = bf16_trunc(sin_yaw * ky);
-                    float rx = bf16_trunc(cos_kx - sin_ky);
-                    float sin_kx = bf16_trunc(sin_yaw * kx);
-                    float cos_ky = bf16_trunc(cos_yaw * ky);
-                    float ry = bf16_trunc(sin_kx + cos_ky);
+                    float cos_kx = cos_yaw * kx;
+                    float sin_ky = sin_yaw * ky;
+                    float rx = cos_kx - sin_ky;
+                    float sin_kx = sin_yaw * kx;
+                    float cos_ky = cos_yaw * ky;
+                    float ry = sin_kx + cos_ky;
                     float rz = kz;
-                    float px = bf16_trunc(rx + cx);
-                    float py = bf16_trunc(ry + cy);
-                    float pz = bf16_trunc(rz + cz);
+                    float px = rx + cx;
+                    float py = ry + cy;
+                    float pz = rz + cz;
 
                     float proj_x = px * P0 + py * P1 + pz * P2 + P3;
                     float proj_y = px * P4 + py * P5 + pz * P6 + P7;
@@ -258,16 +258,16 @@ void kernel_main() {
                     float ky = bf16_to_f32(kp_bf16[bf16_offset + 1]);
                     float kz = bf16_to_f32(kp_bf16[bf16_offset + 2]);
 
-                    float cos_kx = bf16_trunc(cos_yaw * kx);
-                    float sin_ky = bf16_trunc(sin_yaw * ky);
-                    float rx = bf16_trunc(cos_kx - sin_ky);
-                    float sin_kx = bf16_trunc(sin_yaw * kx);
-                    float cos_ky = bf16_trunc(cos_yaw * ky);
-                    float ry = bf16_trunc(sin_kx + cos_ky);
+                    float cos_kx = cos_yaw * kx;
+                    float sin_ky = sin_yaw * ky;
+                    float rx = cos_kx - sin_ky;
+                    float sin_kx = sin_yaw * kx;
+                    float cos_ky = cos_yaw * ky;
+                    float ry = sin_kx + cos_ky;
                     float rz = kz;
-                    float px = bf16_trunc(rx + cx);
-                    float py = bf16_trunc(ry + cy);
-                    float pz = bf16_trunc(rz + cz);
+                    float px = rx + cx;
+                    float py = ry + cy;
+                    float pz = rz + cz;
 
                     float proj_x = px * P0 + py * P1 + pz * P2  + P3;
                     float proj_y = px * P4 + py * P5 + pz * P6  + P7;

@@ -28,17 +28,17 @@ Porting the Sparse4D v3 3D object detection model to Tenstorrent devices (Wormho
 
 ### Accuracy
 
-Sparse4D-TT currently exhibits a 0.06 mAP drop compared to the FP32 baseline, primarily due to BF16 precision constraints on the Wormhole N300 accelerator.
+Sparse4D-TT currently exhibits a 0.05 mAP drop compared to the FP32 baseline, primarily due to BF16 precision constraints on the Wormhole N300 accelerator.
 
 |  | PyTorch (CUDA) | TT-NN (N300) | Gap |
 | :--- | :---: | :---: | :---: |
-| **mAP** | 0.4529 | **0.3898** | -0.0631 |
-| **NDS** | 0.5602 | **0.5150** | -0.0452 |
-| **mATE** | 0.5455 | **0.6235** | +0.0780 |
-| **mASE** | 0.2622 | **0.2694** | +0.0072 |
-| **mAOE** | 0.4373 | **0.4589** | +0.0216 |
-| **mAVE** | 0.2195 | **0.2687** | +0.0492 |
-| **mAAE** | 0.1987 | **0.1784** | -0.0203 |
+| **mAP** | 0.4529 | **0.3968** | -0.0561 |
+| **NDS** | 0.5602 | **0.5192** | -0.0410 |
+| **mATE** | 0.5455 | **0.6163** | +0.0708 |
+| **mASE** | 0.2622 | **0.2689** | +0.0067 |
+| **mAOE** | 0.4373 | **0.4693** | +0.0320 |
+| **mAVE** | 0.2195 | **0.2590** | +0.0395 |
+| **mAAE** | 0.1987 | **0.1790** | -0.0197 |
 
 ### Inference video
 
