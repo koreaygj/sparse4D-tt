@@ -34,6 +34,11 @@ void kernel_main() {
 
             for (uint32_t clp = 0; clp < chunk_size; clp++) {
                 // 1. Tilize RM→TILE
+                // L1 accumulate must be OFF here: tile_cb is only G pages deep, so every
+                // iteration packs to the same L1 address. With acc still enabled from the
+                // previous iteration's output pack, the tilized features would be summed
+                // into the previous iteration's, making clp i contribute i times.
+                pack_reconfig_l1_acc(0);
                 cb_wait_front(feat_cb, G);  // G pages = 16KB of RM data
                 cb_reserve_back(tile_cb, G);
                 tilize_block(feat_cb, G, tile_cb);

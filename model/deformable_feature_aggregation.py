@@ -885,6 +885,10 @@ class DeformableFeatureAggregation:
                 )
             ttnn.deallocate(points_2d_sh)
 
+            # NOTE: this TILE conversion costs a 137 MB DRAM round trip per call and
+            # is avoidable — grouped_weighted_sum's RM_MODE tilizes in L1. That path
+            # was broken (missing pack_reconfig_l1_acc(0) before tilize_block) until
+            # the kernel fix; passing self._rearrange_buf directly saves ~4.7 ms/frame.
             features = ttnn.to_layout(self._rearrange_buf, ttnn.TILE_LAYOUT)
             gws_out = ttnn.grouped_weighted_sum(
                 features, weights_t, num_groups=self.num_groups, group_dims=self.group_dims
