@@ -259,8 +259,11 @@ class Sparse4DInference:
         pad_0 = torch.nn.functional.pad(imgs_0, (0, 1), value=0)
         pad_1 = torch.nn.functional.pad(imgs_1, (0, 1), value=0)
         stacked = torch.cat([pad_0, pad_1], dim=0)
-        # Host-only tensor (TILE layout, no device)
-        return _ttnn.from_torch(stacked.bfloat16(), layout=_ttnn.TILE_LAYOUT,
+        # ROW_MAJOR, not TILE: TILE pads the 4-channel last dim out to 32, which
+        # inflates the tensor 8x (4.12 -> 33 MB/device). ttnn.conv2d takes ROW_MAJOR
+        # NHWC directly, so the host tilize (37 ms) and the extra PCIe traffic
+        # (85 -> 42 ms) are both pure waste.
+        return _ttnn.from_torch(stacked.bfloat16(), layout=_ttnn.ROW_MAJOR_LAYOUT,
                                 mesh_mapper=_ttnn.ShardTensorToMesh(self._mesh_device, dim=0))
 
     def preprocess_images(self, images: torch.Tensor):
@@ -529,7 +532,7 @@ class Sparse4DInference:
         if not hasattr(self, '_img_dev_slot') or self._img_dev_slot is None:
             self._img_dev_slot = ttnn.allocate_tensor_on_device(
                 ttnn.Shape([1, 1, 3 * 256 * 704, 4]),
-                ttnn.bfloat16, ttnn.TILE_LAYOUT, self._mesh_device)
+                ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, self._mesh_device)
         ttnn.copy_host_to_device_tensor(host_input, self._img_dev_slot)
         tt_input = self._img_dev_slot
 
