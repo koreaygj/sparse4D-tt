@@ -17,7 +17,8 @@ pip install -r requirement.txt
 
 ## 2. Custom Kernel Build
 
-This project uses 3 custom TT-Metal kernels. They must be built into the tt-metal library before running.
+This project uses 4 custom TT-Metal kernels, plus one patch to an upstream op. All of them
+must be built into the tt-metal library before running.
 
 ### 2.1 Copy kernel source
 
@@ -25,6 +26,16 @@ This project uses 3 custom TT-Metal kernels. They must be built into the tt-meta
 cp -r tt-metal/ops/kps_project_fused ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/grouped_weighted_sum ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/transposed_s2i ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
+cp -r tt-metal/ops/grid_compact ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
+```
+
+`grid_sample` is an **upstream** op, patched rather than added — it gains an optional
+`batch_index` so a grid stick can name its own source image instead of having it inferred
+from the stick's position. Overwrite it in place; it is already registered, so sections
+2.2 - 2.4 do not apply to it:
+
+```bash
+cp -r tt-metal/ops/grid_sample ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 ```
 
 ### 2.2 Register in CMake
@@ -36,6 +47,7 @@ Add to `file(GLOB_RECURSE kernels ...)`:
     kps_project_fused/device/kernels/*
     grouped_weighted_sum/device/kernels/*
     transposed_s2i/device/kernels/*
+    grid_compact/device/kernels/*
 ```
 
 Add to `target_sources(ttnn_op_pool PRIVATE ...)`:
@@ -49,6 +61,9 @@ Add to `target_sources(ttnn_op_pool PRIVATE ...)`:
     transposed_s2i/transposed_s2i.cpp
     transposed_s2i/device/transposed_s2i_device_operation.cpp
     transposed_s2i/device/transposed_s2i_program_factory.cpp
+    grid_compact/grid_compact.cpp
+    grid_compact/device/grid_compact_device_operation.cpp
+    grid_compact/device/grid_compact_program_factory.cpp
 ```
 
 ### 2.3 Register nanobind
@@ -60,6 +75,7 @@ Add to the nanobind source list (near other `pool/` entries):
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/kps_project_fused/kps_project_fused_nanobind.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/grouped_weighted_sum/grouped_weighted_sum_nanobind.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/transposed_s2i/transposed_s2i_nanobind.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/grid_compact/grid_compact_nanobind.cpp
 ```
 
 ### 2.4 Register Python bindings
@@ -71,6 +87,7 @@ Add includes (near other `pool/` includes):
 #include "ttnn/operations/pool/kps_project_fused/kps_project_fused_nanobind.hpp"
 #include "ttnn/operations/pool/grouped_weighted_sum/grouped_weighted_sum_nanobind.hpp"
 #include "ttnn/operations/pool/transposed_s2i/transposed_s2i_nanobind.hpp"
+#include "ttnn/operations/pool/grid_compact/grid_compact_nanobind.hpp"
 ```
 
 Add bind calls in the `m_pool` section (near `grid_sample::bind_grid_sample(m_pool)`):
@@ -78,6 +95,7 @@ Add bind calls in the `m_pool` section (near `grid_sample::bind_grid_sample(m_po
     kps_project_fused::bind_kps_project_fused(m_pool);
     grouped_weighted_sum::bind_grouped_weighted_sum(m_pool);
     transposed_s2i::bind_transposed_s2i(m_pool);
+    grid_compact::bind_grid_compact(m_pool);
 ```
 
 ### 2.5 Build & Install
