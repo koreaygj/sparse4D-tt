@@ -63,9 +63,14 @@ else:
 #
 #   pooled per device: mean 540, p50 541, p95 738, p99 819, max 902 of 2700
 #
+# The default scales with the camera count, because the number of cameras a single DFA
+# owns is not fixed: the mesh path gives it 3 (one device's half of 6) and the
+# single-device path gives it all 6. A constant sized for 3 would silently drop about half
+# the visible anchors on the single-device path.
+#
 # Overflow costs accuracy only, never speed: the shapes are fixed, so the kernel stops
 # writing past the budget and every stage walks the same number of rows regardless.
-_OOB_CAP = int(_os.environ.get("TT_OOB_CAP", "928"))
+_OOB_CAP_ENV = _os.environ.get("TT_OOB_CAP")
 
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
@@ -143,11 +148,18 @@ class DeformableFeatureAggregation:
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec
         )
 
+        # 928 rows covers 3 cameras with the measured max of 902; scale it linearly and
+        # keep it tile-aligned. TT_OOB_CAP overrides the total outright.
+        self._oob_cap = (
+            int(_OOB_CAP_ENV) if _OOB_CAP_ENV is not None
+            else ((num_cams * 928 // 3 + 31) // 32) * 32
+        )
+
         # Same, for the pooled compacted grid: CAP rows total instead of num_cams*900.
         # The batch-index shard must have the same height so a core's slice of it lines up
         # index-for-index with the grid sticks that core owns; its width is 8 only because
         # a sharded page has to be 32 B aligned and grid_sample reads element 0.
-        _cshard_h = (_OOB_CAP + 55) // 56
+        _cshard_h = (self._oob_cap + 55) // 56
         self._cgrid_sharded_mem = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
             ttnn.BufferType.L1,
@@ -164,6 +176,7 @@ class DeformableFeatureAggregation:
         self._cindex = None
         self._cflags = None
         self._cbidx = None
+        self._compact_shape = None
 
         # L1 sharded config for precomputed grid (pts*6 per point instead of pts*2)
         _padded_precomputed = ((num_pts * 6 + 7) // 8) * 8  # 78 → 80
@@ -862,6 +875,12 @@ class DeformableFeatureAggregation:
         grid and batch index; the source rows and the per-anchor keep flags land in
         self._cindex / self._cflags.
         """
+        # The buffers below are sized from the first call's n/nc and then reused, so a
+        # later call with a different anchor count would silently write out of range.
+        assert (n, nc) == (self._compact_shape or (n, nc)), (
+            f"compaction buffers were built for {self._compact_shape}, got {(n, nc)}"
+        )
+        self._compact_shape = (n, nc)
         if self._cgrid is None:
             _kw = dict(
                 layout=ttnn.ROW_MAJOR_LAYOUT,
@@ -874,18 +893,18 @@ class DeformableFeatureAggregation:
             # of bounds: grid_sample still samples them (their index entry is SENTINEL,
             # so transposed_s2i discards the result) and must not read a stale NaN.
             self._cgrid = ttnn.from_torch(
-                torch.full((1, _OOB_CAP, 1, self.num_pts * 2), 9.0),
+                torch.full((1, self._oob_cap, 1, self.num_pts * 2), 9.0),
                 dtype=ttnn.float32, **_kw,
             )
             self._cindex = ttnn.from_torch(
-                torch.zeros(1, 1, 1, _OOB_CAP, dtype=torch.int32),
+                torch.zeros(1, 1, 1, self._oob_cap, dtype=torch.int32),
                 dtype=ttnn.uint32, **_kw,
             )
             self._cflags = ttnn.from_torch(
                 torch.zeros(nc, 1, 1, n), dtype=ttnn.bfloat16, **_kw
             )
             self._cbidx = ttnn.from_torch(
-                torch.zeros(1, 1, _OOB_CAP, 8, dtype=torch.int32),
+                torch.zeros(1, 1, self._oob_cap, 8, dtype=torch.int32),
                 dtype=ttnn.uint32, **_kw,
             )
 
@@ -897,7 +916,7 @@ class DeformableFeatureAggregation:
         thr_y = 1.0 + 1.0 / min(h for h, _ in spatial_shapes)
         ttnn.grid_compact(
             points_2d, self._cgrid, self._cindex, self._cflags,
-            num_pts=self.num_pts, capacity=_OOB_CAP, anchors=n,
+            num_pts=self.num_pts, capacity=self._oob_cap, anchors=n,
             threshold_x=thr_x, threshold_y=thr_y, bidx=self._cbidx,
         )
         return (
@@ -995,11 +1014,8 @@ class DeformableFeatureAggregation:
             ttnn.deallocate(key_points)
             ttnn.deallocate(anchor_rm)
 
-            # Allocate the feature buffer BEFORE anything compaction-specific: its DRAM
-            # address must not depend on TT_OOB_COMPACT. grouped_weighted_sum reads
-            # slightly past it on the very first call (the buffer is zero-filled, so the
-            # tail it touches is whatever the allocator handed over), which makes frame
-            # 0 sensitive to allocation order — see debug/verify_oob_compact.py.
+            # Allocated before anything compaction-specific so its DRAM address does not
+            # depend on TT_OOB_COMPACT, which keeps an A/B against the dense path honest.
             total_clp = nc * self.num_levels * self.num_pts
             if getattr(self, "_rearrange_buf", None) is None:
                 _buf = torch.zeros(total_clp, n, self.embed_dims, dtype=torch.bfloat16)
@@ -1031,7 +1047,7 @@ class DeformableFeatureAggregation:
                     num_cams=nc, num_pts=self.num_pts, num_anchors=n,
                     num_levels=self.num_levels, level=level_idx,
                     index=self._cindex if _OOB_COMPACT else None,
-                    capacity=_OOB_CAP if _OOB_COMPACT else 0,
+                    capacity=self._oob_cap if _OOB_COMPACT else 0,
                 )
             ttnn.deallocate(points_2d_sh)
             if bidx_sh is not None:
@@ -1039,8 +1055,9 @@ class DeformableFeatureAggregation:
 
             # Feed the ROW_MAJOR buffer straight to grouped_weighted_sum: its RM_MODE
             # tilizes in L1, so the ttnn.to_layout(..., TILE_LAYOUT) this replaces — a
-            # 137 MB DRAM round trip per call — is not needed. Requires the RM_MODE
-            # kernel fix (pack_reconfig_l1_acc(0) before tilize_block).
+            # 137 MB DRAM round trip per call — is not needed. RM_MODE is only correct
+            # with the kernel fix that configures both compute pipelines before the loop;
+            # without it the op is wrong on its first call after any other op has run.
             gws_out = ttnn.grouped_weighted_sum(
                 self._rearrange_buf, weights_t,
                 num_groups=self.num_groups, group_dims=self.group_dims,
