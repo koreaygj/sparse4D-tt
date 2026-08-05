@@ -96,6 +96,7 @@ void kernel_main() {
     constexpr uint32_t use_batch_index = get_compile_time_arg_val(BIDX_OFFSET);
     constexpr uint32_t batch_index_cb_index = get_compile_time_arg_val(BIDX_OFFSET + 1);
     constexpr uint32_t batch_index_stride = get_compile_time_arg_val(BIDX_OFFSET + 2);
+    constexpr uint32_t grid_batch = get_compile_time_arg_val(BIDX_OFFSET + 3);
 
     volatile tt_l1_ptr uint32_t* batch_index_ptr = nullptr;
     if constexpr (use_batch_index) {
@@ -120,7 +121,11 @@ void kernel_main() {
 
     // Clamp this core's stick count to exclude height-sharding padding.
     // Padding sticks contain garbage that would produce invalid NOC addresses.
-    constexpr uint32_t total_valid_sticks = input_batch * grid_hw;  // logical grid sticks across all batches
+    // Grid batch, not input batch: with a pooled grid the two differ (one batch of sticks
+    // against N input images), and using input_batch here made the reader treat the
+    // height-sharding padding sticks as real — garbage coordinates and, worse, a garbage
+    // batch index turned into a NOC address.
+    constexpr uint32_t total_valid_sticks = grid_batch * grid_hw;
     const uint32_t remaining =  // valid sticks from this core's start to end of grid
         (global_grid_stick_start < total_valid_sticks) ? (total_valid_sticks - global_grid_stick_start) : 0;
     const uint32_t valid_sticks_this_core =  // min(assigned, remaining) — actual work for this core

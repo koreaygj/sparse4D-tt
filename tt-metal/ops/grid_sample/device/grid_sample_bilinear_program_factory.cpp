@@ -277,6 +277,10 @@ ProgramDescriptor GridSampleBilinearProgramFactory::create_descriptor(
         reader_compile_time_args.push_back(batch_index_cb_index);
         reader_compile_time_args.push_back(
             use_batch_index ? static_cast<uint32_t>(batch_index_tensor->padded_shape()[-1]) : 1U);
+        // The GRID's batch, which is not the input's once batch_index is in play: a pooled
+        // grid is one batch of sticks that each name their own source image. The reader
+        // needs it to know where the real sticks end and height-sharding padding begins.
+        reader_compile_time_args.push_back(grid_shape[0]);
     }
 
     const std::string reader_kernel_path =
