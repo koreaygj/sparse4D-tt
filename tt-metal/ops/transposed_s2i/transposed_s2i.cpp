@@ -9,8 +9,9 @@ namespace ttnn::operations::transposed_s2i {
 void transposed_s2i(
     const tt::tt_metal::Tensor& input, tt::tt_metal::Tensor& output,
     uint32_t num_cams, uint32_t num_pts, uint32_t num_anchors,
-    uint32_t num_levels, uint32_t level) {
-    ttnn::prim::transposed_s2i(input, output, num_cams, num_pts, num_anchors, num_levels, level);
+    uint32_t num_levels, uint32_t level,
+    const std::optional<tt::tt_metal::Tensor>& index, uint32_t capacity) {
+    ttnn::prim::transposed_s2i(input, output, num_cams, num_pts, num_anchors, num_levels, level, index, capacity);
 }
 
 }  // namespace ttnn::operations::transposed_s2i

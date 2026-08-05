@@ -35,16 +35,18 @@ Tensor TransposedS2iOperation::create_output_tensors(
 void transposed_s2i(
     const Tensor& input, Tensor& output,
     uint32_t num_cams, uint32_t num_pts, uint32_t num_anchors,
-    uint32_t num_levels, uint32_t level) {
+    uint32_t num_levels, uint32_t level,
+    const std::optional<Tensor>& index, uint32_t capacity) {
     using Op = TransposedS2iOperation;
     ttnn::device_operation::launch<Op>(
         Op::operation_attributes_t{
             .num_cams = num_cams, .num_pts = num_pts,
             .num_anchors = num_anchors, .num_levels = num_levels,
             .level = level,
+            .capacity = capacity,
             .output_mem_config = output.memory_config(),
         },
-        Op::tensor_args_t{.input = input, .output = output});
+        Op::tensor_args_t{.input = input, .output = output, .index = index});
 }
 
 }  // namespace ttnn::prim

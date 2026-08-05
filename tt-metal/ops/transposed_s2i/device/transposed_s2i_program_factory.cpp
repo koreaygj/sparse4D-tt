@@ -36,7 +36,20 @@ TransposedS2iProgramFactory::cached_program_t TransposedS2iProgramFactory::creat
     auto logical_cores = corerange_to_cores(core_range, std::nullopt, true);
     const uint32_t num_cores = logical_cores.size();
 
-    const uint32_t total_sticks = NC * N * K;
+    // With an index, `capacity` is the TOTAL number of compacted rows, not a per-camera
+    // count: a pooled compaction has no per-camera structure left to multiply by.
+    const bool use_index = t.index.has_value();
+    const uint32_t total_rows = use_index ? attrs.capacity : NC * N;
+    const uint32_t total_sticks = total_rows * K;
+    const uint32_t idx_count = total_rows;
+
+    constexpr uint32_t IDX_CB = tt::CBIndex::c_0;
+    if (use_index) {
+        const uint32_t idx_bytes = idx_count * sizeof(uint32_t);
+        auto idx_cb_cfg = CircularBufferConfig(idx_bytes, {{IDX_CB, DataFormat::UInt32}})
+                              .set_page_size(IDX_CB, idx_bytes);
+        CreateCircularBuffer(program, core_range, idx_cb_cfg);
+    }
 
     // Compile-time args
     std::vector<uint32_t> ct_args = {
@@ -46,8 +59,14 @@ TransposedS2iProgramFactory::cached_program_t TransposedS2iProgramFactory::creat
         NC,                 // 3
         attrs.num_levels,   // 4: NL
         attrs.level,        // 5: LEVEL
+        use_index ? 1u : 0u,// 6
+        IDX_CB,             // 7
+        idx_count,          // 8
     };
     TensorAccessorArgs(*output_tensor.buffer()).append_to(ct_args);
+    if (use_index) {
+        TensorAccessorArgs(*t.index->buffer()).append_to(ct_args);
+    }
 
     KernelHandle kernel_id = CreateKernel(
         program,
@@ -67,7 +86,8 @@ TransposedS2iProgramFactory::cached_program_t TransposedS2iProgramFactory::creat
             output_tensor.buffer()->address(),
             sticks_this_core,
             stick_offset,
-            in_buffer.address()});
+            in_buffer.address(),
+            use_index ? t.index->buffer()->address() : 0u});
         stick_offset += shard_h;
     }
 
@@ -91,6 +111,9 @@ void TransposedS2iProgramFactory::override_runtime_arguments(
         auto& r = GetRuntimeArgs(prog, sv.kernel_id, sv.logical_cores[i]);
         r[0] = output_tensor.buffer()->address();
         r[3] = t.input.buffer()->address();
+        if (t.index.has_value()) {
+            r[4] = t.index->buffer()->address();
+        }
     }
 }
 
