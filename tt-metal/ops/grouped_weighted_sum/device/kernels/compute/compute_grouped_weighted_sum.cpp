@@ -26,28 +26,35 @@ void kernel_main() {
     uint32_t total_clp   = get_arg_val<uint32_t>(2);
 
     if constexpr (RM_MODE) {
-        // Initialize tilize pipeline first
+        // Configure BOTH pipelines up front. The loop below alternates between tilize and
+        // bcast, and without this the first iteration ran the bcast half with whatever the
+        // PREVIOUSLY EXECUTED OP left in the unpacker/packer config. That made gws correct
+        // on every repeat call but wrong on the first call after any other op had run —
+        // silently, and only in RM_MODE. See debug/verify_gws_determinism.py.
+        binary_op_init_common(tile_cb, wt_cb, out_cb);
+        mul_bcast_cols_init_short(tile_cb, wt_cb);
         tilize_init(feat_cb, G, tile_cb);
 
         for (uint32_t wu = 0; wu < num_wus; wu++) {
             cb_reserve_back(out_cb, G);
 
             for (uint32_t clp = 0; clp < chunk_size; clp++) {
-                // 1. Tilize RM→TILE
+                // 1. Tilize RM→TILE.
                 // L1 accumulate must be OFF here: tile_cb is only G pages deep, so every
                 // iteration packs to the same L1 address. With acc still enabled from the
                 // previous iteration's output pack, the tilized features would be summed
                 // into the previous iteration's, making clp i contribute i times.
                 pack_reconfig_l1_acc(0);
+                tilize_init(feat_cb, G, tile_cb);
                 cb_wait_front(feat_cb, G);  // G pages = 16KB of RM data
                 cb_reserve_back(tile_cb, G);
                 tilize_block(feat_cb, G, tile_cb);
                 cb_push_back(tile_cb, G);
                 cb_pop_front(feat_cb, G);
 
-                // 2. Switch to bcast mode
+                // 2. Switch back to bcast. Only the short init is needed: the full
+                // hw configure was already done once before the loop.
                 tilize_uninit(feat_cb, tile_cb);
-                binary_op_init_common(tile_cb, wt_cb, out_cb);
                 mul_bcast_cols_init_short(tile_cb, wt_cb);
 
                 // 3. Multiply + accumulate
@@ -66,9 +73,6 @@ void kernel_main() {
 
                 cb_pop_front(tile_cb, G);
                 cb_pop_front(wt_cb, G);
-
-                // 4. Switch back to tilize for next CLP
-                tilize_init(feat_cb, G, tile_cb);
             }
 
             pack_reconfig_l1_acc(0);

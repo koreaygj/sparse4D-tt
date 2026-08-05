@@ -16,7 +16,8 @@ void bind_transposed_s2i(nb::module_& mod) {
         &ttnn::transposed_s2i,
         nb::arg("input"), nb::arg("output"),
         nb::arg("num_cams"), nb::arg("num_pts"), nb::arg("num_anchors"),
-        nb::arg("num_levels"), nb::arg("level"));
+        nb::arg("num_levels"), nb::arg("level"),
+        nb::arg("index") = std::nullopt, nb::arg("capacity") = 0);
 }
 
 }  // namespace ttnn::operations::transposed_s2i

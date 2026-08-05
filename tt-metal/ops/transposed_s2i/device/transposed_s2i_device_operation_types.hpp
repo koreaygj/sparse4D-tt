@@ -3,6 +3,7 @@
 
 #pragma once
 #include <tt-metalium/constants.hpp>
+#include <optional>
 #include "ttnn/tensor/tensor.hpp"
 
 namespace ttnn::prim {
@@ -14,12 +15,14 @@ struct TransposedS2iParams {
     uint32_t num_anchors;   // N
     uint32_t num_levels;    // NL
     uint32_t level;         // current level index
+    uint32_t capacity;      // compacted rows per camera; 0 = dense (no index)
     tt::tt_metal::MemoryConfig output_mem_config;
 };
 
 struct TransposedS2iInputs {
     const tt::tt_metal::Tensor& input;   // L1 HEIGHT_SHARDED [nc, N, K, C]
     const tt::tt_metal::Tensor& output;  // pre-allocated DRAM [CLP, N, C]
+    std::optional<tt::tt_metal::Tensor> index;  // compacted-row -> source row
 };
 
 }  // namespace ttnn::prim

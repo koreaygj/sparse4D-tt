@@ -1118,7 +1118,7 @@ def main():
     parser.add_argument(
         "--dual-device",
         action="store_true",
-        help="Use 2 devices (batch=3 each) for backbone+FPN with HiFi4+fp32_acc precision",
+        help="Use 2 devices, 3 cameras each, for backbone+FPN",
     )
     parser.add_argument(
         "--bf16",
@@ -1140,7 +1140,10 @@ def main():
         type=str,
         choices=["lofi", "hifi2", "hifi4"],
         default=None,
-        help="Override math fidelity for all head modules (default: per-module setting)",
+        help="BROKEN, do not use: the override leaves a mixed-fidelity pipeline. "
+             "Measured against a HiFi4 reference, --fidelity hifi2 moves the FPN "
+             "output FURTHER from full precision than the LoFi default (PCC 0.9927 "
+             "vs 0.9998) and costs 0.024 mAP. See debug/probe_fidelity_pcc.py.",
     )
     args = parser.parse_args()
 

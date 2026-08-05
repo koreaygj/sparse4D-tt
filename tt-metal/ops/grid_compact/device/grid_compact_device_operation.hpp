@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -6,17 +6,17 @@
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/device_operation.hpp"
-#include "transposed_s2i_device_operation_types.hpp"
-#include "transposed_s2i_program_factory.hpp"
+#include "grid_compact_device_operation_types.hpp"
+#include "grid_compact_program_factory.hpp"
 
 namespace ttnn::prim {
 
-struct TransposedS2iOperation {
-    using operation_attributes_t = TransposedS2iParams;
-    using tensor_args_t = TransposedS2iInputs;
+struct GridCompactOperation {
+    using operation_attributes_t = GridCompactParams;
+    using tensor_args_t = GridCompactInputs;
     using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = tt::tt_metal::Tensor;
-    using program_factory_t = std::variant<TransposedS2iProgramFactory>;
+    using program_factory_t = std::variant<GridCompactProgramFactory>;
 
     static program_factory_t select_program_factory(
         const operation_attributes_t&, const tensor_args_t&);
@@ -28,12 +28,13 @@ struct TransposedS2iOperation {
         const operation_attributes_t&, const tensor_args_t&);
 };
 
-void transposed_s2i(
-    const tt::tt_metal::Tensor& input,
-    tt::tt_metal::Tensor& output,
-    uint32_t num_cams, uint32_t num_pts, uint32_t num_anchors,
-    uint32_t num_levels, uint32_t level,
-    const std::optional<tt::tt_metal::Tensor>& index = std::nullopt,
-    uint32_t capacity = 0);
+void grid_compact(
+    const tt::tt_metal::Tensor& grid,
+    tt::tt_metal::Tensor& cgrid,
+    tt::tt_metal::Tensor& index,
+    tt::tt_metal::Tensor& flags,
+    uint32_t num_pts, uint32_t capacity, uint32_t anchors,
+    float threshold_x, float threshold_y,
+    const std::optional<tt::tt_metal::Tensor>& bidx = std::nullopt);
 
 }  // namespace ttnn::prim

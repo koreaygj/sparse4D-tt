@@ -144,6 +144,11 @@ class Sparse4DInference:
     Connects TtResNetBottleneck + FPN + Sparse4DHead.
     """
 
+    # Shape the image tensor is uploaded in: [mesh_dim, 1, rows, cols] holding the
+    # same 2 * 3 * 256 * 704 * 4 elements as [2, 1, 540672, 4], but with 512-wide
+    # rows so each ROW_MAJOR page is 1 KB instead of 8 B. See _prepare_host_input.
+    UPLOAD_SHAPE = (2, 1, 4224, 512)
+
     def __init__(
         self,
         device,
@@ -259,8 +264,19 @@ class Sparse4DInference:
         pad_0 = torch.nn.functional.pad(imgs_0, (0, 1), value=0)
         pad_1 = torch.nn.functional.pad(imgs_1, (0, 1), value=0)
         stacked = torch.cat([pad_0, pad_1], dim=0)
-        # Host-only tensor (TILE layout, no device)
-        return _ttnn.from_torch(stacked.bfloat16(), layout=_ttnn.TILE_LAYOUT,
+        # ROW_MAJOR, not TILE: TILE pads the 4-channel last dim out to 32, which
+        # inflates the tensor 8x (4.12 -> 33 MB/device). ttnn.conv2d takes ROW_MAJOR
+        # NHWC directly, so the host tilize (37 ms) and the extra PCIe traffic
+        # (85 -> 42 ms) are both pure waste.
+        #
+        # Upload wide, not [.., 540672, 4]: a ROW_MAJOR tensor is paged one row per
+        # page, so a 4-channel row is an 8-byte page and the 4.12 MB payload becomes
+        # 540,672 transfers. h2d then costs 540672 x 72.9 ns = 39 ms of pure per-page
+        # overhead against 0.13 ms of actual data (the link streams at 30.9 GB/s).
+        # Reshaping to 1 KB pages drops h2d to 0.55 ms; UPLOAD_SHAPE is the same
+        # bytes in the same order, so preprocess_images reshapes it back on device.
+        return _ttnn.from_torch(stacked.reshape(*self.UPLOAD_SHAPE).bfloat16(),
+                                layout=_ttnn.ROW_MAJOR_LAYOUT,
                                 mesh_mapper=_ttnn.ShardTensorToMesh(self._mesh_device, dim=0))
 
     def preprocess_images(self, images: torch.Tensor):
@@ -425,7 +441,11 @@ class Sparse4DInference:
         Worker process: cam3-5 on device 1 (opened independently)
 
         No dispatch core conflict because each process uses a different device.
-        Enables HiFi4 + fp32_dest_acc_en at batch=3 for improved precision.
+
+        Note: backbone and FPN run at LoFi with bf16 here, not the HiFi4 + fp32_dest_acc
+        this docstring used to claim. fp32 activations do not fit at batch=3 — L1
+        allocation fails outright — and the FPN output is within PCC 0.9998 of a
+        full-mantissa fp32-accumulate reference anyway.
 
         Args:
             images: [bs, 6, 3, 256, 704] normalized images
@@ -528,10 +548,12 @@ class Sparse4DInference:
 
         if not hasattr(self, '_img_dev_slot') or self._img_dev_slot is None:
             self._img_dev_slot = ttnn.allocate_tensor_on_device(
-                ttnn.Shape([1, 1, 3 * 256 * 704, 4]),
-                ttnn.bfloat16, ttnn.TILE_LAYOUT, self._mesh_device)
+                ttnn.Shape([1, 1, self.UPLOAD_SHAPE[2], self.UPLOAD_SHAPE[3]]),
+                ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, self._mesh_device)
         ttnn.copy_host_to_device_tensor(host_input, self._img_dev_slot)
-        tt_input = self._img_dev_slot
+        # Back to the NHWC shape conv2d consumes. Same bytes in the same order, so
+        # this is a re-paging on device (~2 ms) in exchange for 39 ms of h2d.
+        tt_input = ttnn.reshape(self._img_dev_slot, (1, 1, 3 * 256 * 704, 4))
 
         # Backbone SPMD: each device processes its 3 cameras
         backbone_features = self.backbone(tt_input)
