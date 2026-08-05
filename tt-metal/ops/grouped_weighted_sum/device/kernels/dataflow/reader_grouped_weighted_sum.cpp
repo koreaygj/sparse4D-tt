@@ -43,6 +43,20 @@ void kernel_main() {
     constexpr uint32_t feat_tpb = N_TR * FEAT_TC;  // tiles per batch (TILE mode only)
     constexpr uint32_t wt_tpb = N_TR;
 
+    // The last tile row covers anchors past the end of the tensor (900..927 of 928), which
+    // the loop below never reads. tilize still consumes all 32 rows, so zero the buffer once
+    // here rather than leaving stale L1: those rows are sliced off the output, but they must
+    // not be able to carry a NaN into the accumulation. Once is enough — nothing ever writes
+    // to the tail sticks, so they stay zero for the life of the kernel. Doing this per
+    // iteration instead cost 3.4 ms/frame, since it re-zeroed the same addresses 78 times.
+    if constexpr (RM_MODE) {
+        volatile tt_l1_ptr uint32_t* z =
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(feat_cb));
+        for (uint32_t i = 0; i < (NUM_GROUPS * 2 * feat_page_bytes) / 4; i++) {
+            z[i] = 0;
+        }
+    }
+
     for (uint32_t wu = 0; wu < num_wus; wu++) {
         uint32_t wu_id = start_wu + wu;
         uint32_t n_tr = wu_id % N_TR_TOTAL;
