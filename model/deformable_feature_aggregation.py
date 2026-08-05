@@ -32,6 +32,41 @@ if _env is not None:
 else:
     _HAS_CUSTOM_KERNELS = _KERNELS_AVAILABLE
 
+
+# OOB compaction: drop the (camera, anchor) rows whose key points all project outside
+# their image before grid_sample sees them. Roughly two thirds of rows do — with 6 cameras
+# an anchor is visible to one or two. grid_sample already skips the DRAM reads for such
+# points, but it still pays CB page, barrier and reduce per point, and that fixed cost is
+# where its time actually goes. Bit-identical to the dense path, 103.7 -> 95.2 ms.
+#
+# On by default when the ops are present, like _HAS_CUSTOM_KERNELS above; TT_OOB_COMPACT=0
+# forces the dense path. It needs BOTH grid_compact and the grid_sample patch that adds
+# batch_index — an older tt-metal build can have the first without the second, and the
+# docstring is the only thing nanobind exposes to tell them apart.
+_OOB_AVAILABLE = hasattr(ttnn, "grid_compact") and "batch_index" in (ttnn.grid_sample.__doc__ or "")
+_env = _os.environ.get("TT_OOB_COMPACT")
+if _env is not None:
+    _OOB_COMPACT = _env == "1"
+else:
+    _OOB_COMPACT = _HAS_CUSTOM_KERNELS and _OOB_AVAILABLE
+
+# TT_OOB_CAP is the total row budget for the compacted grid. Shapes must not vary or every
+# call recompiles, so it is fixed and has to cover the busiest frame.
+#
+# The rows are POOLED across the device's cameras rather than kept in one block per camera.
+# That matters more than it sounds: per camera the budget must cover the busiest CAMERA,
+# and the cameras do not peak together — measured over 16 scenes (11520 camera-calls,
+# debug/measure_oob_capacity.py) the zero-loss budget is 3 x 563 = 1689 rows per camera
+# but only 902 pooled, for exactly the same guarantee. Pooling needs grid_sample to take
+# the source camera as data (its batch_index argument) instead of inferring it from a
+# row's position, which is what the accompanying tt-metal change adds.
+#
+#   pooled per device: mean 540, p50 541, p95 738, p99 819, max 902 of 2700
+#
+# Overflow costs accuracy only, never speed: the shapes are fixed, so the kernel stops
+# writing past the budget and every stage walks the same number of rows regardless.
+_OOB_CAP = int(_os.environ.get("TT_OOB_CAP", "928"))
+
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -107,6 +142,28 @@ class DeformableFeatureAggregation:
         self._grid_sharded_mem = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec
         )
+
+        # Same, for the pooled compacted grid: CAP rows total instead of num_cams*900.
+        # The batch-index shard must have the same height so a core's slice of it lines up
+        # index-for-index with the grid sticks that core owns; its width is 8 only because
+        # a sharded page has to be 32 B aligned and grid_sample reads element 0.
+        _cshard_h = (_OOB_CAP + 55) // 56
+        self._cgrid_sharded_mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                _core_grid, (_cshard_h, _padded_last), ttnn.ShardOrientation.ROW_MAJOR
+            ),
+        )
+        self._cbidx_sharded_mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(_core_grid, (_cshard_h, 8), ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        self._cgrid = None
+        self._cindex = None
+        self._cflags = None
+        self._cbidx = None
 
         # L1 sharded config for precomputed grid (pts*6 per point instead of pts*2)
         _padded_precomputed = ((num_pts * 6 + 7) // 8) * 8  # 78 → 80
@@ -797,6 +854,82 @@ class DeformableFeatureAggregation:
 
         return weights
 
+    def _compact_grid(self, points_2d, n, nc, spatial_shapes):
+        """Compact the sampling grid to the rows that actually hit an image.
+
+        All cameras share one pooled list, in source-row order; each kept row records its
+        camera in _cbidx, which grid_sample consumes as batch_index. Returns the sharded
+        grid and batch index; the source rows and the per-anchor keep flags land in
+        self._cindex / self._cflags.
+        """
+        if self._cgrid is None:
+            _kw = dict(
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            if self._mesh_device is not None:
+                _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            # Rows past a camera's kept count are never written, so seed them far out
+            # of bounds: grid_sample still samples them (their index entry is SENTINEL,
+            # so transposed_s2i discards the result) and must not read a stale NaN.
+            self._cgrid = ttnn.from_torch(
+                torch.full((1, _OOB_CAP, 1, self.num_pts * 2), 9.0),
+                dtype=ttnn.float32, **_kw,
+            )
+            self._cindex = ttnn.from_torch(
+                torch.zeros(1, 1, 1, _OOB_CAP, dtype=torch.int32),
+                dtype=ttnn.uint32, **_kw,
+            )
+            self._cflags = ttnn.from_torch(
+                torch.zeros(nc, 1, 1, n), dtype=ttnn.bfloat16, **_kw
+            )
+            self._cbidx = ttnn.from_torch(
+                torch.zeros(1, 1, _OOB_CAP, 8, dtype=torch.int32),
+                dtype=ttnn.uint32, **_kw,
+            )
+
+        # With align_corners=False a point contributes iff g is in [-1 - 1/S, 1 + 1/S),
+        # S being W on x and H on y. Take the loosest LEVEL so one compaction serves all
+        # four — the grid itself is level-independent — but keep the axes separate: the
+        # coarsest level is 8 x 22, so sharing 1 + 1/8 across both would keep everything.
+        thr_x = 1.0 + 1.0 / min(w for _, w in spatial_shapes)
+        thr_y = 1.0 + 1.0 / min(h for h, _ in spatial_shapes)
+        ttnn.grid_compact(
+            points_2d, self._cgrid, self._cindex, self._cflags,
+            num_pts=self.num_pts, capacity=_OOB_CAP, anchors=n,
+            threshold_x=thr_x, threshold_y=thr_y, bidx=self._cbidx,
+        )
+        return (
+            ttnn.to_memory_config(self._cgrid, self._cgrid_sharded_mem),
+            ttnn.to_memory_config(self._cbidx, self._cbidx_sharded_mem),
+        )
+
+    def _mask_weights(self, weights_t, n, nc):
+        """Zero the attention weights of the rows compaction dropped.
+
+        A dropped row is never written into _rearrange_buf, which therefore still holds
+        LAST frame's features in that slot; grouped_weighted_sum would multiply that
+        stale data by a live weight. Masking annihilates it, and multiplying by exactly
+        0.0/1.0 is exact in every float format, so the kept rows are untouched.
+        Zeroing the 68.6 MB feature buffer instead would cost more than compaction saves.
+        """
+        f = ttnn.to_layout(self._cflags, ttnn.TILE_LAYOUT)  # [nc, 1, 1, n]
+        mask = ttnn.transpose(f, -2, -1)  # [nc, 1, n, 1]
+        ttnn.deallocate(f)
+        # clp = cam*NL*K + level*K + pt, so the camera axis splits off the front of
+        # weights_t for free (leading dims carry no tile padding) and the flag then
+        # broadcasts over the level/point axis and the group axis in one multiply.
+        w4 = ttnn.reshape(
+            weights_t, (nc, self.num_levels * self.num_pts, n, self.num_groups)
+        )
+        out = ttnn.multiply(w4, mask)
+        ttnn.deallocate(mask)
+        ttnn.deallocate(w4)
+        return ttnn.reshape(
+            out, (nc * self.num_levels * self.num_pts, n, self.num_groups)
+        )
+
     def run(
         self,
         instance_feature: ttnn.Tensor,
@@ -821,6 +954,7 @@ class DeformableFeatureAggregation:
         key_points = self._kps_generator_pre_rotation(
             anchor, instance_feature, bs, num_anchor
         )
+        # the kernel reads the anchor as row-major pages
         anchor_rm = ttnn.reshape(anchor, (n, 1, 11))
         anchor_rm = ttnn.to_layout(anchor_rm, ttnn.ROW_MAJOR_LAYOUT)
 
@@ -861,29 +995,47 @@ class DeformableFeatureAggregation:
             ttnn.deallocate(key_points)
             ttnn.deallocate(anchor_rm)
 
-            points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
-            ttnn.deallocate(points_2d)
-
-            weights_t = ttnn.transpose(weights, 0, 1)
-
+            # Allocate the feature buffer BEFORE anything compaction-specific: its DRAM
+            # address must not depend on TT_OOB_COMPACT. grouped_weighted_sum reads
+            # slightly past it on the very first call (the buffer is zero-filled, so the
+            # tail it touches is whatever the allocator handed over), which makes frame
+            # 0 sensitive to allocation order — see debug/verify_oob_compact.py.
             total_clp = nc * self.num_levels * self.num_pts
-            if not hasattr(self, '_rearrange_buf') or self._rearrange_buf is None:
+            if getattr(self, "_rearrange_buf", None) is None:
                 _buf = torch.zeros(total_clp, n, self.embed_dims, dtype=torch.bfloat16)
                 _kw = dict(dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
                 if self._mesh_device is not None:
                     _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
                 self._rearrange_buf = ttnn.from_torch(_buf, **_kw)
 
+            bidx_sh = None
+            if _OOB_COMPACT:
+                points_2d_sh, bidx_sh = self._compact_grid(
+                    points_2d, n, nc, spatial_shapes
+                )
+            else:
+                points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
+            ttnn.deallocate(points_2d)
+
+            weights_t = ttnn.transpose(weights, 0, 1)
+            if _OOB_COMPACT:
+                weights_t = self._mask_weights(weights_t, n, nc)
+
             for level_idx, fm_tt in enumerate(feature_maps):
                 sampled = ttnn.grid_sample(
-                    fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False
+                    fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False,
+                    batch_index=bidx_sh,
                 )
                 ttnn.transposed_s2i(
                     sampled, self._rearrange_buf,
                     num_cams=nc, num_pts=self.num_pts, num_anchors=n,
                     num_levels=self.num_levels, level=level_idx,
+                    index=self._cindex if _OOB_COMPACT else None,
+                    capacity=_OOB_CAP if _OOB_COMPACT else 0,
                 )
             ttnn.deallocate(points_2d_sh)
+            if bidx_sh is not None:
+                ttnn.deallocate(bidx_sh)
 
             # Feed the ROW_MAJOR buffer straight to grouped_weighted_sum: its RM_MODE
             # tilizes in L1, so the ttnn.to_layout(..., TILE_LAYOUT) this replaces — a
