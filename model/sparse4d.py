@@ -441,7 +441,11 @@ class Sparse4DInference:
         Worker process: cam3-5 on device 1 (opened independently)
 
         No dispatch core conflict because each process uses a different device.
-        Enables HiFi4 + fp32_dest_acc_en at batch=3 for improved precision.
+
+        Note: backbone and FPN run at LoFi with bf16 here, not the HiFi4 + fp32_dest_acc
+        this docstring used to claim. fp32 activations do not fit at batch=3 — L1
+        allocation fails outright — and the FPN output is within PCC 0.9998 of a
+        full-mantissa fp32-accumulate reference anyway.
 
         Args:
             images: [bs, 6, 3, 256, 704] normalized images

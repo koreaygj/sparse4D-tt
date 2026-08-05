@@ -16,7 +16,7 @@ using namespace tt::tt_metal;
 // Single core on purpose: the pass is a sequential scan with a running output
 // counter, which across cores would need a prefix sum. Measured alternative --
 // giving each core its own fixed slot budget so no core has to talk -- has to size
-// for the busiest core and yields only 1.5x compaction versus 2.4x pooled.
+// for the busiest core and compacts far worse than pooling across cameras does.
 GridCompactProgramFactory::cached_program_t GridCompactProgramFactory::create(
     const GridCompactParams& attrs,
     const GridCompactInputs& t,

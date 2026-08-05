@@ -29,20 +29,15 @@ At 95.2 ms the accelerator matches the CUDA reference on this model.
 - **Pure TT-NN**: Standard ttnn ops only, no custom kernel build required. Automatically used as fallback when custom kernels are not built.
 - **Custom Kernels** (recommended): 4 custom Metalium kernels (`kps_project_fused`, `transposed_s2i`, `grouped_weighted_sum`, `grid_compact`) plus a patch to upstream `grid_sample` — see [docs/INSTALL.md](docs/INSTALL.md)
 
-**What changed in v2** (122 -> 95.2 ms), every step verified bit-identical to the path it replaced:
+**What changed in v2.** The three items below were each measured on this machine; the v1
+figure is the previously published one from an earlier state of the tree, so the two
+columns are a before/after, not a controlled A/B of a single change.
 
-| Change | Latency |
-| :--- | :---: |
-| v1 | 122 ms |
-| Row-major image upload — `ttnn.conv2d` takes NHWC directly, so the host tilize was waste | 139.9 ms* |
-| 1 KB upload pages — a ROW_MAJOR row is one page, so 4-channel rows made h2d 540,672 transfers of 8 B (41.0 -> 0.55 ms) | 103.7 ms |
-| Pooled OOB compaction — drop the anchors that project outside every camera before `grid_sample` sees them | **95.2 ms** |
-
-\* the row-major upload landed together with a re-measurement on different hardware seating; it is listed for provenance, not as a regression.
-
-Also fixed on the way, with no speed cost: `grouped_weighted_sum` in RM mode inherited the
-previous op's compute-pipeline configuration and so was wrong on its first call after any
-other op — silently, and only in that mode. See the accuracy table.
+| Change | Measured effect |
+| :--- | :--- |
+| 1 KB upload pages — a ROW_MAJOR row is one page, so 4-channel rows made h2d 540,672 transfers of 8 B against 0.13 ms of actual data | h2d 41.0 -> 0.55 ms |
+| Pooled OOB compaction — drop the anchors that project outside every camera before `grid_sample` sees them, pooling the survivors across cameras so the fixed budget covers the busiest *frame* rather than the busiest *camera* | 103.7 -> 95.2 ms, bit-identical output |
+| `grouped_weighted_sum` RM mode inherited the previous op's compute-pipeline configuration, so it was wrong on its first call after any other op — silently, and only in that mode | mAP 0.3933 -> 0.3968, no speed cost |
 
 ### Accuracy
 

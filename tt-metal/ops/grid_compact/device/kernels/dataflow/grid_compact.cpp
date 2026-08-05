@@ -21,12 +21,14 @@
 // SENTINEL, and transposed_s2i skips those, so stale coordinates can never reach
 // the output. That avoids writing padding rows every call.
 //
-// Compaction is PER CAMERA: camera c's kept rows land in cgrid[c*CAP .. c*CAP+CAP).
-// Pooling all cameras into one list compacts better (2.4x vs 1.5x), but grid_sample
-// derives the source image from a row's POSITION (curr_batch advances every grid_hw
-// sticks), so a pooled list would silently sample the wrong camera. Keeping the
-// per-camera blocks preserves that mapping with no change to grid_sample at all.
-// CAP must therefore cover the BUSIEST camera, measured max 62.7% of 900.
+// Two output layouts. PER CAMERA (no bidx) puts camera c's kept rows in
+// cgrid[c*CAP .. c*CAP+CAP), which grid_sample can read unmodified because it derives a
+// row's source image from its POSITION. POOLED (bidx given) puts every camera's rows in
+// one shared list and records each row's camera, which needs grid_sample's batch_index.
+//
+// Pooled is what makes compaction pay. Per camera the budget must cover the busiest
+// CAMERA, and the cameras do not peak together: measured over 16 scenes, the zero-loss
+// budget is 3 x 563 = 1689 rows per camera against 902 pooled, for the same guarantee.
 //
 // A third output, `flags`, marks the kept (camera, anchor) pairs with 1.0. Dropped
 // rows are never written into the feature buffer, so it keeps LAST frame's values
