@@ -88,7 +88,7 @@ Cleared by measurement, and still clear:
 
 ### Inference video
 
-https://github.com/user-attachments/assets/3752d051-9e4a-4a9d-9410-eec0bdcb3027
+https://github.com/user-attachments/assets/fc16cb97-e5b9-454b-8ce0-ea83a270ca95
 
 
 ## Setup
