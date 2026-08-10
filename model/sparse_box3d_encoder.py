@@ -140,7 +140,7 @@ class SparseBox3DEncoder:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -148,7 +148,7 @@ class SparseBox3DEncoder:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -156,7 +156,7 @@ class SparseBox3DEncoder:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _run_layers(self, x: ttnn.Tensor, layers: list, name: str = "") -> ttnn.Tensor:
         """Run Linear+ReLU (→LN) chain with fused activation."""
@@ -193,6 +193,10 @@ class SparseBox3DEncoder:
         Returns:
             output: [bs, num_anchor, output_dims] on device (TILE)
         """
+        # The anchor may be fp32 for the projection's sake; this path is a matmul chain
+        # whose error never reaches a pixel, so it takes the bf16 view.
+        if box_3d.dtype != ttnn.bfloat16:
+            box_3d = ttnn.typecast(box_3d, ttnn.bfloat16)
         # Extract components via device slice (no host roundtrip)
         n = bs * num_anchor
 

@@ -22,6 +22,11 @@ import numpy as np
 import torch
 import ttnn
 
+import os as _os
+
+# TT_ANCHOR_FP32=0 puts the anchor back in bf16 for an A/B.
+_ANCHOR_DTYPE = ttnn.bfloat16 if _os.environ.get("TT_ANCHOR_FP32") == "0" else ttnn.float32
+
 # Anchor box field indices
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -64,17 +69,24 @@ class InstanceBank:
         # Pre-cache constant anchor/feature on device (avoid repeated host→device upload)
         anchor_tiled = anchor_data.float().unsqueeze(0).contiguous()  # [1, num_anchor, 11]
         feature_tiled = instance_feature_data.float().unsqueeze(0).contiguous()  # [1, num_anchor, embed_dims]
-        self._dev_anchor = self._to_dev(anchor_tiled)
+        # The anchor is fp32, not bf16, and it is the one tensor in the head where that is
+        # worth it. Its x and y reach +-60 m, so bf16's relative error becomes 0.03 m of
+        # absolute error, and the projection divides by depth — which cancels the distance
+        # and leaves a flat 0.081 px of grid error on the finest FPN level (measured).
+        # It is also [900, 11], so fp32 costs 20 KB a frame.
+        self._dev_anchor = self._to_dev(anchor_tiled, _ANCHOR_DTYPE)
         self._dev_feature = self._to_dev(feature_tiled)
 
         self.reset()
 
-    def _to_dev(self, tensor: torch.Tensor) -> ttnn.Tensor:
+    def _to_dev(self, tensor: torch.Tensor, dtype=None) -> ttnn.Tensor:
         """Helper: from_torch with mesh_mapper if mesh mode."""
-        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+        dtype = dtype or ttnn.bfloat16
+        kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=dtype)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        host = tensor.float() if dtype == ttnn.float32 else tensor.bfloat16()
+        return ttnn.from_torch(host, **kwargs)
 
     def _from_dev(self, tensor: ttnn.Tensor) -> torch.Tensor:
         """Helper: to_torch with mesh_composer if mesh mode."""
@@ -126,7 +138,9 @@ class InstanceBank:
                 dtype=torch.float32,
             ).bfloat16()
 
-            _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
+            # The rotation matrices multiply the anchor, so they follow its dtype — a
+            # mixed-dtype matmul is not what we want here and ttnn would reject it anyway.
+            _kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=_ANCHOR_DTYPE)
             if self._mesh_device is not None:
                 _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
 
@@ -161,7 +175,7 @@ class InstanceBank:
             cached_anchor = ttnn.concat([center, size, yaw_out, vel_out], dim=-1)
             ttnn.deallocate(center); ttnn.deallocate(size)
             ttnn.deallocate(yaw_out); ttnn.deallocate(vel_out)
-            self.cached_anchor = cached_anchor
+            self.cached_anchor = self._as_bank_dtype(cached_anchor)
 
             time_interval_pt = torch.where(
                 torch.logical_and(time_interval_pt != 0, self.mask),
@@ -182,6 +196,18 @@ class InstanceBank:
         time_interval = ttnn.reshape(time_interval, (bs,))
 
         return instance_feature, anchor, cached_feature, cached_anchor, time_interval
+
+    def _as_bank_dtype(self, anchor: ttnn.Tensor) -> ttnn.Tensor:
+        """The bank stores anchors in one dtype, whatever route they arrived by.
+
+        The anchor reaches update()/cache() from the refinement, and reaches the temporal
+        path from a chain of slices and matmuls; keeping the invariant here rather than
+        chasing every producer is what stops a concat between the two from failing on a
+        dtype mismatch. Widening a bf16 value costs nothing — it is already rounded.
+        """
+        if anchor.dtype != _ANCHOR_DTYPE:
+            return ttnn.typecast(anchor, _ANCHOR_DTYPE)
+        return anchor
 
     def update(
         self,
@@ -205,6 +231,7 @@ class InstanceBank:
         if self.cached_feature is None:
             return instance_feature, anchor
 
+        anchor = self._as_bank_dtype(anchor)
         N = self.num_anchor - self.num_temp_instances  # 300
 
         # Device-side topk (no host roundtrip)
@@ -313,7 +340,7 @@ class InstanceBank:
 
         anch_dim = anchor.shape[-1]
         idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
-        self.cached_anchor = ttnn.gather(anchor, 1, idx_anch)
+        self.cached_anchor = ttnn.gather(self._as_bank_dtype(anchor), 1, idx_anch)
         ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
         self.confidence = ttnn.reshape(top_conf, (1, 1, bs, K))

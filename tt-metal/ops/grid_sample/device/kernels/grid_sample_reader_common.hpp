@@ -20,6 +20,15 @@ constexpr uint32_t STANDARD_GRID_ELEMENTS_PER_POINT = 2;
 // Data type constants (from ttnn/api/ttnn/tensor/types.hpp DataType enum)
 constexpr uint32_t DTYPE_BFLOAT16 = 0;
 constexpr uint32_t DTYPE_FLOAT32 = 1;
+// UINT16 is a CONTAINER for a Q14 fixed-point coordinate, not an unsigned value. The
+// coordinate is clamped to [-2, 2], so a float's exponent bits buy nothing while the
+// bilinear weight it feeds is the coordinate's fractional part and wants uniform
+// absolute precision. Measured relative error in the sampled value: bf16 3.8e-2,
+// Q14 8.6e-4, against 1.0e-3 from the feature map's own bf16 storage.
+// The shift is shared with kps_project_fused (which writes it) and grid_compact.
+constexpr uint32_t DTYPE_UINT16 = 6;
+constexpr int32_t GRID_FIXED_SHIFT = 14;
+constexpr float GRID_FIXED_INV = 1.0f / (float)(1 << GRID_FIXED_SHIFT);
 
 // Utility functions
 ALWI bool is_coordinate_valid(int32_t coord, uint32_t max_size) {
@@ -79,6 +88,13 @@ struct GridCoordinateReader {
                 const uint32_t float_offset = grid_idx * STANDARD_GRID_ELEMENTS_PER_POINT;
                 w_coord_rel = float_data[float_offset + 0];  // x coordinate
                 h_coord_rel = float_data[float_offset + 1];  // y coordinate
+            } else if constexpr (grid_dtype == DTYPE_UINT16) {
+                // Q14 fixed point: reinterpret the 16 bits as signed and scale.
+                const uint32_t coordinate_pair_offset = grid_idx * STANDARD_GRID_ELEMENTS_PER_POINT;
+                const uint16_t h_raw = grid_ptr[coordinate_pair_offset + 1];  // y coordinate
+                const uint16_t w_raw = grid_ptr[coordinate_pair_offset + 0];  // x coordinate
+                h_coord_rel = static_cast<float>(static_cast<int16_t>(h_raw)) * GRID_FIXED_INV;
+                w_coord_rel = static_cast<float>(static_cast<int16_t>(w_raw)) * GRID_FIXED_INV;
             } else {
                 // For BFLOAT16 grid, read as uint16 and convert
                 const uint32_t coordinate_pair_offset = grid_idx * STANDARD_GRID_ELEMENTS_PER_POINT;

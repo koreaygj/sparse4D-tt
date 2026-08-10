@@ -21,6 +21,25 @@ constexpr uint32_t ANC_X = 0, ANC_Y = 1, ANC_Z = 2;
 constexpr uint32_t ANC_SIN_YAW = 6, ANC_COS_YAW = 7;
 
 // bf16 → f32 conversion: bf16 is upper 16 bits of f32
+// Q14 fixed point over [-2, 2]: the grid coordinate is clamped to that range, so the
+// exponent bits a float spends are dead weight, while the bilinear weight it feeds is the
+// coordinate's FRACTIONAL part and therefore wants uniform ABSOLUTE precision. Both
+// grid_compact and grid_sample decode with the same shift; changing it means changing all
+// three. GRID_FIXED_SHIFT 29 with an int32 container is the same code at twice the width.
+constexpr int32_t GRID_FIXED_SHIFT = 14;
+constexpr float GRID_FIXED_SCALE = (float)(1 << GRID_FIXED_SHIFT);
+
+inline int16_t f32_to_grid_fixed(float g) {
+    // Saturate rather than wrap: the clamp above already caps |g| at 2, whose exact
+    // encoding is one past INT16_MAX, and anything at the cap is far outside the bounds
+    // test regardless.
+    float v = g * GRID_FIXED_SCALE;
+    int32_t q = (int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+    if (q > 32767) q = 32767;
+    if (q < -32768) q = -32768;
+    return (int16_t)q;
+}
+
 inline float bf16_to_f32(uint16_t bf16) {
     uint32_t bits = static_cast<uint32_t>(bf16) << 16;
     float result;
@@ -80,6 +99,11 @@ void kernel_main() {
     constexpr uint32_t PRECOMPUTE_OFFSET = wh_args.next_compile_time_args_offset();
     constexpr uint32_t PRECOMPUTE = get_compile_time_arg_val(PRECOMPUTE_OFFSET);
     constexpr uint32_t NL = get_compile_time_arg_val(PRECOMPUTE_OFFSET + 1);
+    // The anchor centre reaches the projection as either bf16 or fp32. bf16 costs 0.081 px
+    // of grid error on the finest FPN level (measured, layer 0) because its absolute error
+    // scales with |x|, |y| which reach +-60 m — and the projection's division by depth
+    // cancels the distance, leaving the error flat rather than falling off.
+    constexpr uint32_t ANC_FP32 = get_compile_time_arg_val(PRECOMPUTE_OFFSET + 2);
 
     const auto kp_accessor = TensorAccessor(kp_args, kp_addr, kp_page_size);
     const auto anchor_accessor = TensorAccessor(anchor_args, anchor_addr, anchor_page_size);
@@ -117,12 +141,22 @@ void kernel_main() {
             noc_async_read(noc_addr, anchor_l1, anchor_page_size);
             noc_async_read_barrier();
         }
-        volatile tt_l1_ptr uint16_t* anc_bf16 = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(anchor_l1);
-        float cos_yaw = bf16_to_f32(anc_bf16[ANC_COS_YAW]);
-        float sin_yaw = bf16_to_f32(anc_bf16[ANC_SIN_YAW]);
-        float cx = bf16_to_f32(anc_bf16[ANC_X]);
-        float cy = bf16_to_f32(anc_bf16[ANC_Y]);
-        float cz = bf16_to_f32(anc_bf16[ANC_Z]);
+        float cos_yaw, sin_yaw, cx, cy, cz;
+        if constexpr (ANC_FP32) {
+            volatile tt_l1_ptr float* a = reinterpret_cast<volatile tt_l1_ptr float*>(anchor_l1);
+            cos_yaw = a[ANC_COS_YAW];
+            sin_yaw = a[ANC_SIN_YAW];
+            cx = a[ANC_X];
+            cy = a[ANC_Y];
+            cz = a[ANC_Z];
+        } else {
+            volatile tt_l1_ptr uint16_t* a = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(anchor_l1);
+            cos_yaw = bf16_to_f32(a[ANC_COS_YAW]);
+            sin_yaw = bf16_to_f32(a[ANC_SIN_YAW]);
+            cx = bf16_to_f32(a[ANC_X]);
+            cy = bf16_to_f32(a[ANC_Y]);
+            cz = bf16_to_f32(a[ANC_Z]);
+        }
 
         // Read key_points[a, :num_pts, :3]
         uint32_t kp_l1 = get_write_ptr(kp_cb_index);
@@ -250,7 +284,12 @@ void kernel_main() {
                     cb_reserve_back(out_cb_index, NC);
                 }
                 uint32_t out_l1 = get_write_ptr(out_cb_index) + c * out_page_size;
-                volatile tt_l1_ptr float* out = reinterpret_cast<volatile tt_l1_ptr float*>(out_l1);
+                // The projection itself stays in fp32 — only the stored coordinate is
+                // quantised. Rounding at the end rather than partway keeps it to the
+                // single step the consumer actually sees, which matters here because the
+                // intermediate 1/z spans up to 1e10 and needs the float range.
+                volatile tt_l1_ptr int16_t* out =
+                    reinterpret_cast<volatile tt_l1_ptr int16_t*>(out_l1);
 
                 for (uint32_t p = 0; p < NUM_PTS; p++) {
                     uint32_t bf16_offset = p * (kp_page_size / sizeof(uint16_t));
@@ -284,8 +323,8 @@ void kernel_main() {
                     if (grid_y < -2.0f) grid_y = -2.0f;
                     if (grid_y >  2.0f) grid_y =  2.0f;
 
-                    out[p * 2 + 0] = grid_x;
-                    out[p * 2 + 1] = grid_y;
+                    out[p * 2 + 0] = f32_to_grid_fixed(grid_x);
+                    out[p * 2 + 1] = f32_to_grid_fixed(grid_y);
                 }
                 // Batch CB: push all NC pages at once (last camera only)
                 if (c == NC - 1) {

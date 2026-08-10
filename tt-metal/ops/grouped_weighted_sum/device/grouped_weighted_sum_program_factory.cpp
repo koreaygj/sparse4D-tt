@@ -76,6 +76,11 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
     reader_ct_args.push_back(rm_mode ? 1U : 0U);  // RM_MODE
     reader_ct_args.push_back(N_total);              // RM_N
     reader_ct_args.push_back(rm_mode ? rm_stick_size : 0U); // RM_STICK_SZ
+    // Compact weights, [N, clp*G]: one tile spans 32/G consecutive clp with no padding
+    // column, against one tile per clp with 24 of 32 columns wasted.
+    const bool wt_compact = t.weights.logical_shape()[-1] == static_cast<int32_t>(G * n);
+    reader_ct_args.push_back(wt_compact ? 1U : 0U);                 // WT_COMPACT
+    reader_ct_args.push_back(wt_compact ? (G * n) / 32 : 0U);       // WT_TC: tiles per row
 
     auto reader_kernel_id = CreateKernel(program,
         "ttnn/cpp/ttnn/operations/pool/grouped_weighted_sum/device/kernels/dataflow/reader_grouped_weighted_sum.cpp",

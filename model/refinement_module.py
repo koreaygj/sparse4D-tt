@@ -97,7 +97,7 @@ class SparseBox3DRefinementModule:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -105,7 +105,7 @@ class SparseBox3DRefinementModule:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -113,7 +113,7 @@ class SparseBox3DRefinementModule:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _run_layers(self, x: ttnn.Tensor, layers: list) -> ttnn.Tensor:
         for idx, entry in enumerate(layers):
@@ -177,6 +177,13 @@ class SparseBox3DRefinementModule:
         refined = ttnn.multiply(refined, self.refine_scale)
         ttnn.deallocate(refined_pre_scale)
         refined = ttnn.reshape(refined, (bs, num_anchor, self.output_dim))
+        # The anchor is the accumulator: it is added to at every layer, so it carries the
+        # width, while the delta this linear produced stays bf16. Wide accumulator, narrow
+        # increment — the same reason mixed-precision training keeps fp32 master weights.
+        if refined.dtype != anchor.dtype:
+            _pre = refined
+            refined = ttnn.typecast(refined, anchor.dtype)
+            ttnn.deallocate(_pre)
 
         # Residual refinement
         if self.refine_yaw:

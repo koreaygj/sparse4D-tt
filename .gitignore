@@ -23,3 +23,5 @@ debug/
 # AI
 .claude/
 logs/
+*.swp
+*.swo

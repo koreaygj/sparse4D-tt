@@ -72,6 +72,27 @@ else:
 # writing past the budget and every stage walks the same number of rows regardless.
 _OOB_CAP_ENV = _os.environ.get("TT_OOB_CAP")
 
+# COMPACT attention weights: keep them as [N, CLP*G] all the way into
+# grouped_weighted_sum instead of reshaping to [N, CLP, G] and transposing to [CLP, N, G].
+#
+# G is 8 and a tile is 32 wide, so the [.., G] layouts spend 24 of every 32 columns on
+# padding — the tensor, the transpose that follows it, and the mask multiply all move 4x
+# the numbers they need to. The compact layout is what weights_fc already produces, and a
+# tile of it holds 32 anchors x 4 consecutive CLP with nothing wasted.
+#
+# The cost is that softmax has to reduce over a stride-G axis, which no stock op does. It
+# is expressed here as exp, a 0/1 matmul for the per-group sums, a second to scatter them
+# back, and a divide. Measured against the reshape+softmax+transpose+mask chain it
+# replaces: 1151 -> ~220 us per DFA call.
+#
+# Needs the grouped_weighted_sum reader that accepts [N, CLP*G]; an older build of the op
+# raises on the shape rather than reading it wrong, so the failure is loud.
+_env = _os.environ.get("TT_WT_COMPACT")
+if _env is not None:
+    _WT_COMPACT = _env == "1"
+else:
+    _WT_COMPACT = _HAS_CUSTOM_KERNELS
+
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -116,6 +137,45 @@ class DeformableFeatureAggregation:
             packer_l1_acc=False,
             math_approx_mode=False,
         )
+        # The softmax denominator is a sum of 156 terms and is the one place in this path
+        # where the accumulator width shows, so the 0/1 matmuls that compute and scatter it
+        # run at full fidelity with an fp32 destination. They are 1-tile-wide matmuls, so
+        # the extra passes cost almost nothing.
+        self._exact_compute_config = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+            math_approx_mode=False,
+        )
+
+        # 0/1 matrices for the compact-layout softmax. In [N, CLP*G] the CLP axis is
+        # strided by G inside each row, so the per-group sum is a matmul by a matrix that
+        # selects every G-th column, and putting it back is the transpose of that.
+        # Both are padded to the tile width; the padding columns are zero and stay zero.
+        self._clp_gather = self._clp_scatter = self._cam_block = None
+        if _WT_COMPACT:
+            total_clp = num_cams * num_levels * num_pts
+            width = total_clp * num_groups
+            gp = ((num_groups + 31) // 32) * 32
+            gather = torch.zeros(width, gp)
+            for c in range(total_clp):
+                for g in range(num_groups):
+                    gather[c * num_groups + g, g] = 1.0
+            # One column block of CLP*G per camera, so a per-(camera, anchor) flag
+            # broadcasts across that camera's levels, points and groups in one multiply.
+            # Height is num_cams, not the padded tile height: matmul checks the LOGICAL
+            # inner dimension, and the flags come in as [N, num_cams].
+            block = torch.zeros(num_cams, width)
+            per_cam = width // num_cams
+            for c in range(num_cams):
+                block[c, c * per_cam:(c + 1) * per_cam] = 1.0
+            _kw = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+            if self._mesh_device is not None:
+                _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            self._clp_gather = ttnn.from_torch(gather, **_kw)
+            self._clp_scatter = ttnn.from_torch(gather.t().contiguous(), **_kw)
+            self._cam_block = ttnn.from_torch(block, **_kw)
 
         # Weight CLP reorder index: camera-major → level-major
         # Needed because transposed grid produces level-major feature ordering
@@ -252,7 +312,7 @@ class DeformableFeatureAggregation:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move bias tensor to device as [1, 1, 1, N] in TILE layout."""
@@ -261,7 +321,7 @@ class DeformableFeatureAggregation:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move 1D tensor (LayerNorm weight/bias) to device as [1, 1, 1, N]."""
@@ -270,7 +330,7 @@ class DeformableFeatureAggregation:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
 
     # === Fallback methods (pure ttnn ops, no custom kernels) ===
@@ -443,6 +503,10 @@ class DeformableFeatureAggregation:
             camera_embed: [bs, num_cams, 256] on device (TILE)
         """
         # Extract first 3 rows of 4x4: [bs, num_cams, 3, 4] -> [bs, num_cams, 12]
+        # The matrix is fp32 for the projection kernel's sake; this path is a matmul chain
+        # whose error never reaches a pixel, so it takes the bf16 view.
+        if projection_mat.dtype != ttnn.bfloat16:
+            projection_mat = ttnn.typecast(projection_mat, ttnn.bfloat16)
         cam_input = ttnn.slice(projection_mat, [0, 0, 0, 0], [bs, self.num_cams, 3, 4])
         cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
 
@@ -562,8 +626,8 @@ class DeformableFeatureAggregation:
         # Pre-convert grid once (reused across all levels)
         grid = ttnn.to_layout(points_2d, ttnn.ROW_MAJOR_LAYOUT)
         grid = ttnn.to_memory_config(grid, ttnn.DRAM_MEMORY_CONFIG)
-        if grid.dtype != ttnn.float32:
-            grid = ttnn.typecast(grid, ttnn.float32)
+        # The grid is already the Q14 fixed-point uint16 the sampler decodes; a typecast
+        # here would reinterpret the bits as an unsigned integer and destroy them.
 
         # 1. grid_sample_lerp per level
         all_level_features = []
@@ -760,6 +824,10 @@ class DeformableFeatureAggregation:
             camera_embed: [bs, num_cams, 256] on device (TILE)
         """
         # Extract first 3 rows of 4x4: [bs, num_cams, 3, 4] -> [bs, num_cams, 12]
+        # The matrix is fp32 for the projection kernel's sake; this path is a matmul chain
+        # whose error never reaches a pixel, so it takes the bf16 view.
+        if projection_mat.dtype != ttnn.bfloat16:
+            projection_mat = ttnn.typecast(projection_mat, ttnn.bfloat16)
         cam_input = ttnn.slice(projection_mat, [0, 0, 0, 0], [bs, self.num_cams, 3, 4])
         cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
 
@@ -838,6 +906,10 @@ class DeformableFeatureAggregation:
 
         total_clp = self.num_cams * self.num_levels * self.num_pts
         if self.use_camera_embed:
+            # [1, 1, bs*N, CLP*G]. The camera came from the row axis and the linear's
+            # columns are (level, point, group), so the merged column index is exactly
+            # clp*G + g with clp = cam*L*K + level*K + point — the ordering the feature
+            # buffer and the mask both already use.
             weights = ttnn.reshape(
                 weights,
                 (
@@ -847,6 +919,16 @@ class DeformableFeatureAggregation:
                     self.num_cams * self.num_levels * self.num_pts * self.num_groups,
                 ),
             )
+
+        # Only the camera-embed path produces the compact layout for free: without it the
+        # linear has no camera axis to fold into the columns, so CLP*G would not be the
+        # row width and the reshape below is a real one either way.
+        if _WT_COMPACT and self.use_camera_embed:
+            if return_logits:
+                return weights
+            return self._softmax_clp(weights)
+
+        if self.use_camera_embed:
             weights = ttnn.reshape(
                 weights, (bs * num_anchor, total_clp, self.num_groups)
             )
@@ -858,14 +940,130 @@ class DeformableFeatureAggregation:
         if return_logits:
             return weights  # pre-softmax logits
 
-        weights = ttnn.softmax(
-            weights,
-            dim=1,
-            numeric_stable=True,
-            compute_kernel_config=self._hifi_compute_config,
-        )
+        if self._mesh_device is not None:
+            # Same subset problem as _softmax_clp, and stock softmax gives no access to
+            # its denominator, so the reduction is written out.
+            weights = self._softmax_clp_dense(weights)
+        else:
+            weights = ttnn.softmax(
+                weights,
+                dim=1,
+                numeric_stable=True,
+                compute_kernel_config=self._hifi_compute_config,
+            )
 
         return weights
+
+    def _softmax_clp_dense(self, logits):
+        """Softmax over dim 1 of [N, CLP, G], denominator reduced across the mesh.
+
+        The compact path needs 0/1 matmuls because its CLP axis is strided inside the row;
+        here the axis is a real one, so ttnn's own reductions do the local part and all
+        that is added is the two cross-device sums. See _softmax_clp for why the shift is
+        reduced as well — exp(l - m0) and exp(l - m1) cannot be added.
+        """
+        cc = dict(num_links=1, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                  topology=ttnn.Topology.Linear)
+        m = ttnn.max(logits, dim=1, keepdim=True)
+        tot = ttnn.all_reduce(m, **cc)
+        ttnn.deallocate(m)
+        m = ttnn.multiply(tot, 1.0 / self._mesh_device.get_num_devices())
+        ttnn.deallocate(tot)
+        shifted = ttnn.subtract(logits, m)
+        ttnn.deallocate(m)
+        e = ttnn.exp(shifted)
+        ttnn.deallocate(shifted)
+
+        s = ttnn.sum(e, dim=1, keepdim=True)
+        red = ttnn.all_reduce(s, **cc)
+        ttnn.deallocate(s)
+        w = ttnn.divide(e, red)
+        ttnn.deallocate(e)
+        ttnn.deallocate(red)
+        return w
+
+    def _softmax_clp(self, logits):
+        """Softmax over the CLP entries while they stay strided by G inside each row.
+
+        No stock op reduces a strided axis, so the sum is a matmul by a 0/1 matrix that
+        picks every G-th column, and a second one puts the per-group denominator back
+        under every column it belongs to. Everything else is elementwise on the compact
+        tensor, which is a quarter the size of the [N, CLP, G] one this replaces.
+
+        Subtracting the row maximum rather than the per-group maximum still stabilises
+        the exponential — any constant does — and the per-group one would need the very
+        strided reduction being avoided. It is looser by whatever spread there is between
+        groups in a row; debug/probe_clp_softmax.py measures that spread against the
+        exponent range so the looseness stays checkable rather than assumed.
+
+        On a mesh the softmax is NOT local. Each device holds its own cameras, so its CLP
+        axis is a subset of the one the softmax is defined over — 156 of 312 on a 3/3
+        split — and normalising over the subset makes each device's weights sum to 1 on
+        their own, so the all_reduce after the fusion adds two complete distributions
+        instead of one. Measured, that alone is the whole of the DFA's error: replaying
+        the per-device normalisation on exact reference logits reproduces PCC 0.952, and
+        scoring the device against a per-device reference gives 0.999989. So the
+        denominator is reduced across devices here.
+
+        The shift has to be reduced with it. exp(l - m0) and exp(l - m1) are not summable,
+        so both devices must subtract the same constant; any common constant is exact, and
+        the mean of the per-device maxima is one both can reach with the Sum all_reduce
+        this file already uses. It sits within half the spread of the true global maximum,
+        which is what stabilisation actually needs.
+        """
+        m = ttnn.max(logits, dim=-1, keepdim=True)
+        if self._mesh_device is not None:
+            tot = ttnn.all_reduce(
+                m, num_links=1, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=ttnn.Topology.Linear,
+            )
+            ttnn.deallocate(m)
+            m = ttnn.multiply(tot, 1.0 / self._mesh_device.get_num_devices())
+            ttnn.deallocate(tot)
+        shifted = ttnn.subtract(logits, m)
+        ttnn.deallocate(m)
+        e = ttnn.exp(shifted)
+        ttnn.deallocate(shifted)
+
+        s = ttnn.matmul(e, self._clp_gather,
+                        compute_kernel_config=self._exact_compute_config)
+        if self._mesh_device is not None:
+            # The gather's padding columns are zero on every device, so they stay zero.
+            red = ttnn.all_reduce(
+                s, num_links=1, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=ttnn.Topology.Linear,
+            )
+            ttnn.deallocate(s)
+            s = red
+        sb = ttnn.matmul(s, self._clp_scatter,
+                         compute_kernel_config=self._exact_compute_config)
+        ttnn.deallocate(s)
+        # Divide rather than multiply by a reciprocal: this is the one rounding that
+        # softmax itself does, and doing it the same way keeps the two paths comparable.
+        w = ttnn.divide(e, sb)
+        ttnn.deallocate(e)
+        ttnn.deallocate(sb)
+        return w
+
+    def _mask_weights_compact(self, weights, n, nc):
+        """Zero the compact weights of the rows compaction dropped.
+
+        Same job as _mask_weights, in the [N, CLP*G] layout: a camera owns one contiguous
+        block of CLP*G/nc columns, so the per-(camera, anchor) flag becomes a mask over
+        the full row via one matmul against the block matrix. Multiplying by exactly
+        0.0/1.0 is exact in every float format, so the kept rows are untouched.
+        """
+        f = ttnn.to_layout(self._cflags, ttnn.TILE_LAYOUT)  # [nc, 1, 1, n]
+        f2 = ttnn.reshape(f, (nc, n))
+        ttnn.deallocate(f)
+        ft = ttnn.transpose(f2, -2, -1)                     # [n, nc]
+        ttnn.deallocate(f2)
+        mask = ttnn.matmul(ft, self._cam_block, compute_kernel_config=self._hifi_compute_config)
+        ttnn.deallocate(ft)
+        out = ttnn.multiply(weights, mask)
+        ttnn.deallocate(mask)
+        ttnn.deallocate(weights)
+        return out
 
     def _compact_grid(self, points_2d, n, nc, spatial_shapes):
         """Compact the sampling grid to the rows that actually hit an image.
@@ -892,9 +1090,12 @@ class DeformableFeatureAggregation:
             # Rows past a camera's kept count are never written, so seed them far out
             # of bounds: grid_sample still samples them (their index entry is SENTINEL,
             # so transposed_s2i discards the result) and must not read a stale NaN.
+            # Q14 fixed point in a uint16 container, matching kps_project_fused. The seed
+            # is the saturated value, which decodes to just under 2.0 — far outside the
+            # bounds test, so a slot that is never written can only ever be discarded.
             self._cgrid = ttnn.from_torch(
-                torch.full((1, self._oob_cap, 1, self.num_pts * 2), 9.0),
-                dtype=ttnn.float32, **_kw,
+                torch.full((1, self._oob_cap, 1, self.num_pts * 2), 32767, dtype=torch.int32),
+                dtype=ttnn.uint16, **_kw,
             )
             self._cindex = ttnn.from_torch(
                 torch.zeros(1, 1, 1, self._oob_cap, dtype=torch.int32),
@@ -970,9 +1171,17 @@ class DeformableFeatureAggregation:
         )
 
         # 2. Pre-rotation key points + fused KPS projection (overlaps with weight compute on device)
+        # Key points stay bf16: the kernel reads them as bf16 pages, and they are OFFSETS
+        # of object size (1-5 m) rather than positions, so their absolute error is an order
+        # of magnitude below the centre's. Only the anchor keeps the extra width.
+        anchor_bf16 = anchor
+        if anchor.dtype != ttnn.bfloat16:
+            anchor_bf16 = ttnn.typecast(anchor, ttnn.bfloat16)
         key_points = self._kps_generator_pre_rotation(
-            anchor, instance_feature, bs, num_anchor
+            anchor_bf16, instance_feature, bs, num_anchor
         )
+        if anchor_bf16 is not anchor:
+            ttnn.deallocate(anchor_bf16)
         # the kernel reads the anchor as row-major pages
         anchor_rm = ttnn.reshape(anchor, (n, 1, 11))
         anchor_rm = ttnn.to_layout(anchor_rm, ttnn.ROW_MAJOR_LAYOUT)
@@ -1033,9 +1242,17 @@ class DeformableFeatureAggregation:
                 points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
             ttnn.deallocate(points_2d)
 
-            weights_t = ttnn.transpose(weights, 0, 1)
-            if _OOB_COMPACT:
-                weights_t = self._mask_weights(weights_t, n, nc)
+            if _WT_COMPACT and self.use_camera_embed:
+                # Already [1, 1, N, CLP*G] — the layout grouped_weighted_sum reads
+                # directly, so neither the reshape into [N, CLP, G] nor the transpose
+                # that followed it happens at all.
+                weights_t = weights
+                if _OOB_COMPACT:
+                    weights_t = self._mask_weights_compact(weights_t, n, nc)
+            else:
+                weights_t = ttnn.transpose(weights, 0, 1)
+                if _OOB_COMPACT:
+                    weights_t = self._mask_weights(weights_t, n, nc)
 
             for level_idx, fm_tt in enumerate(feature_maps):
                 sampled = ttnn.grid_sample(

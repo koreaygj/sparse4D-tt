@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 import torch
 import torch.nn as nn
+import os as _os
 import ttnn
 from PIL import Image
 from nuscenes.utils.data_classes import Box as NuScenesBox
@@ -415,18 +416,37 @@ def load_model(ckpt_path, device, mesh_device=None, backbone_batch_size=None, fp
     head = _build_head_from_sd(sd, device, mesh_device=mesh_device)
 
     # Override math fidelity for all head modules
+    # TT_FP32_ACC=1 widens the DESTINATION register without touching math fidelity. The
+    # two are separate halves of what makes TT's bf16 differ from PyTorch's — the multiply
+    # truncation and the 16-bit accumulate — and --fidelity hifi4 changes both at once, so
+    # a loss there cannot be attributed. Measured separately, raising fidelity costs mAP
+    # (HiFi2 -0.024, HiFi4 -0.009) while improving mATE/mAOE, so the halves may not point
+    # the same way.
+    _fp32_acc_only = _os.environ.get("TT_FP32_ACC") == "1"
+    if _fp32_acc_only and not fidelity_override:
+        fidelity_override = "keep"
+
     if fidelity_override:
         fidelity_map = {
             "lofi": ttnn.MathFidelity.LoFi,
             "hifi2": ttnn.MathFidelity.HiFi2,
             "hifi4": ttnn.MathFidelity.HiFi4,
         }
-        fidelity = fidelity_map[fidelity_override]
-        fp32_acc = (fidelity_override == "hifi4")
-        new_config = ttnn.init_device_compute_kernel_config(
-            device.arch(), math_fidelity=fidelity,
-            fp32_dest_acc_en=fp32_acc, packer_l1_acc=fp32_acc, math_approx_mode=False,
-        )
+        # "keep" leaves the fidelity each module already chose and only widens the
+        # accumulator, which is the half this run is trying to isolate.
+        keep_fidelity = fidelity_override == "keep"
+        fidelity = None if keep_fidelity else fidelity_map[fidelity_override]
+        fp32_acc = _fp32_acc_only or (fidelity_override == "hifi4")
+        def _cfg(existing_fidelity):
+            return ttnn.init_device_compute_kernel_config(
+                device.arch(),
+                math_fidelity=existing_fidelity if keep_fidelity else fidelity,
+                fp32_dest_acc_en=fp32_acc, packer_l1_acc=fp32_acc, math_approx_mode=False,
+            )
+        # Modules that carry their own config keep its fidelity under "keep"; the ones that
+        # never had one were on the ttnn default, which is HiFi4.
+        _DEF = ttnn.MathFidelity.HiFi4
+        new_config = _cfg(ttnn.MathFidelity.HiFi2 if keep_fidelity else _DEF)
         # Apply to all head sub-modules
         head._hifi_compute_config = new_config
         for layer in head.layers:

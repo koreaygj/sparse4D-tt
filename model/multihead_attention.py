@@ -88,7 +88,7 @@ class MultiheadAttention:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         if tensor.dim() == 1:
@@ -96,7 +96,7 @@ class MultiheadAttention:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def run(
         self,

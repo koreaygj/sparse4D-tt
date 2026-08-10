@@ -42,7 +42,10 @@ KpsProjectFusedProgramFactory::cached_program_t KpsProjectFusedProgramFactory::c
     const uint32_t proj_page_size = tt::round_up(4 * sizeof(float), align);     // proj_mat always f32
     const uint32_t wh_page_size = tt::round_up(2 * sizeof(float), align);       // image_wh always f32
     const uint32_t NL = attrs.precompute_grid ? attrs.spatial_shapes.size() : 0;
-    const uint32_t out_elem_size = (attrs.precompute_grid && !standalone_precompute) ? sizeof(uint16_t) : sizeof(float);
+    // 16 bits either way: bf16 for the precomputed weights, Q14 fixed point for the
+    // standard normalised grid. The formats differ because the quantities do — a weight
+    // in [0, 1] wants relative precision, a clamped coordinate wants absolute.
+    const uint32_t out_elem_size = sizeof(uint16_t);
     const uint32_t out_elems_per_page = attrs.precompute_grid ? num_pts * 6 : num_pts * 2;
     const uint32_t out_page_size = tt::round_up(out_elems_per_page * out_elem_size, align);
 
@@ -83,7 +86,9 @@ KpsProjectFusedProgramFactory::cached_program_t KpsProjectFusedProgramFactory::c
 
     // CB4: output scratch
     const uint32_t out_cb_pages = fused_precompute ? nc * NL : ((attrs.precompute_grid && !fused_precompute) ? nc * NL * 2 : nc);
-    const auto out_df = (attrs.precompute_grid && !standalone_precompute) ? tt::DataFormat::Float16_b : f32_df;
+    const auto out_df = (attrs.precompute_grid && !standalone_precompute)
+                            ? tt::DataFormat::Float16_b   // precomputed bilinear weights
+                            : tt::DataFormat::UInt16;     // Q14 fixed-point coordinates
     const auto [out_cb_index, out_cb_handle] =
         create_cb(cb_idx++, program, all_cores, out_page_size, out_cb_pages, out_df);
 
@@ -155,6 +160,7 @@ KpsProjectFusedProgramFactory::cached_program_t KpsProjectFusedProgramFactory::c
         // H,W passed via runtime args to avoid program cache collision
         reader_ct_args.push_back(1U);  // PRECOMPUTE=1
         reader_ct_args.push_back(NL);  // NL=4
+        reader_ct_args.push_back(t.anchor.dtype() == DataType::FLOAT32 ? 1U : 0U);
         for (uint32_t i = 0; i < 4; i++) {
             reader_ct_args.push_back(0);  // placeholder H (runtime)
             reader_ct_args.push_back(0);  // placeholder W (runtime)
@@ -211,6 +217,9 @@ KpsProjectFusedProgramFactory::cached_program_t KpsProjectFusedProgramFactory::c
         // Standard mode: no precompute args needed
         reader_ct_args.push_back(0U);  // PRECOMPUTE=0
         reader_ct_args.push_back(0U);  // NL=0
+        // The anchor may arrive fp32: its centre is what the projection error is most
+        // sensitive to, and bf16 there costs 0.081 px on the finest level.
+        reader_ct_args.push_back(t.anchor.dtype() == DataType::FLOAT32 ? 1U : 0U);
 
         reader_kernel_id = CreateKernel(
             program,

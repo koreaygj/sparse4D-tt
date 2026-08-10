@@ -22,13 +22,27 @@ void GroupedWeightedSumOperation::validate_on_program_cache_miss(
     TT_FATAL(t.features.layout() == Layout::TILE || t.features.layout() == Layout::ROW_MAJOR,
              "features must be TILE or ROW_MAJOR");
     TT_FATAL(t.weights.layout() == Layout::TILE, "weights must be TILE");
-    TT_FATAL(t.features.logical_shape().rank() == 3, "features must be 3D [n, clp, E]");
-    TT_FATAL(t.weights.logical_shape().rank() == 3, "weights must be 3D [n, clp, G]");
-    TT_FATAL(t.features.logical_shape()[0] == t.weights.logical_shape()[0], "n must match");
-    TT_FATAL(t.features.logical_shape()[1] == t.weights.logical_shape()[1], "clp must match");
+    TT_FATAL(t.features.logical_shape().rank() == 3, "features must be 3D [clp, N, E]");
     TT_FATAL(t.features.logical_shape()[-1] == attrs.num_groups * attrs.group_dims, "E must be G*D");
-    TT_FATAL(t.weights.logical_shape()[-1] == attrs.num_groups, "last dim must be num_groups");
     TT_FATAL(attrs.group_dims == 32, "group_dims must be 32 (== TILE_WIDTH) in current implementation");
+
+    const uint32_t clp = t.features.logical_shape()[0];
+    const uint32_t anchors = t.features.logical_shape()[1];
+    const auto& w = t.weights.logical_shape();
+    // Two accepted weight layouts, told apart by the last dimension. COMPACT [N, clp*G]
+    // fills every column of a tile; the 3D [clp, N, G] leaves 24 of 32 as padding, which
+    // is 4x the tensor and 4x the reader's DRAM traffic for the same numbers.
+    if (w[-1] == attrs.num_groups * clp) {
+        TT_FATAL(w[-2] == anchors, "compact weights must be [N, clp*G]; got N={}", w[-2]);
+        TT_FATAL((attrs.num_groups * clp) % 32 == 0,
+                 "compact weights need clp*G to be a multiple of the tile width; got {}",
+                 attrs.num_groups * clp);
+    } else {
+        TT_FATAL(w.rank() == 3, "weights must be 3D [clp, N, G] or compact [N, clp*G]");
+        TT_FATAL(w[-1] == attrs.num_groups, "last dim must be num_groups");
+        TT_FATAL(w[0] == clp, "clp must match");
+        TT_FATAL(w[1] == anchors, "N must match");
+    }
 }
 
 TensorSpec GroupedWeightedSumOperation::compute_output_specs(
