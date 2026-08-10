@@ -109,8 +109,9 @@ void GridSampleOperation::validate_on_program_cache_miss(
         TT_FATAL(grid_tensor.dtype() == DataType::BFLOAT16, "Precomputed grid tensor must be BFLOAT16");
     } else {
         TT_FATAL(
-            grid_tensor.dtype() == DataType::BFLOAT16 || grid_tensor.dtype() == DataType::FLOAT32,
-            "Grid tensor must be BFLOAT16 or FLOAT32");
+            grid_tensor.dtype() == DataType::BFLOAT16 || grid_tensor.dtype() == DataType::FLOAT32 ||
+                grid_tensor.dtype() == DataType::UINT16,
+            "Grid tensor must be BFLOAT16, FLOAT32, or UINT16 (Q14 fixed point)");
     }
 
     // Layout validation

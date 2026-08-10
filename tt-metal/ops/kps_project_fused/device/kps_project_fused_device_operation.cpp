@@ -71,12 +71,24 @@ TensorSpec KpsProjectFusedOperation::compute_output_specs(
                 output_shape, output_shape));
     }
     // Standard: input [n, pts, 3] → n is dim[0]
+    // The grid is 16-bit FIXED POINT, Q14 over [-2, 2] — see GRID_FIXED_SHIFT below.
+    //
+    // bf16 is the wrong 16-bit format here. The coordinate is clamped to [-2, 2], so the
+    // 8 bits bf16 spends on an exponent buy nothing, while bilinear sampling cares about
+    // the ABSOLUTE error in the coordinate (the weight is its fractional part). Measured
+    // as relative error in the sampled value: bf16 3.8e-2, Q14 fixed point 8.6e-4 — and
+    // the feature map's own bf16 storage already contributes 1.0e-3, so the fixed-point
+    // grid sits below the noise that is there regardless. bf16 coordinates cost
+    // 0.0012 mAP / 0.0024 NDS on nuScenes val; this is what replaces them.
+    //
+    // UINT16 is a container, not the interpretation: ttnn has no INT16, and the kernels
+    // reinterpret the bits. Nothing reads this tensor as an unsigned integer.
     const uint32_t n = t.key_points.logical_shape()[0];
     const ttnn::Shape output_shape({attrs.num_cams, n, 1, attrs.num_pts * 2});
     return TensorSpec(
         output_shape,
         TensorLayout::fromPaddedShape(
-            DataType::FLOAT32,
+            DataType::UINT16,
             PageConfig(Layout::ROW_MAJOR),
             attrs.output_mem_config,
             output_shape, output_shape));

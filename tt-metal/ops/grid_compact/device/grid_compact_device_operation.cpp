@@ -17,8 +17,10 @@ GridCompactOperation::program_factory_t GridCompactOperation::select_program_fac
 
 void GridCompactOperation::validate_on_program_cache_miss(
     const operation_attributes_t& a, const tensor_args_t& t) {
-    TT_FATAL(t.grid.dtype() == DataType::FLOAT32, "grid must be FLOAT32");
-    TT_FATAL(t.cgrid.dtype() == DataType::FLOAT32, "cgrid must be FLOAT32");
+    // Q14 fixed point in a UINT16 container — see kps_project_fused for why the
+    // coordinate is fixed point and not bf16. ttnn has no INT16; the kernel reinterprets.
+    TT_FATAL(t.grid.dtype() == DataType::UINT16, "grid must be UINT16 (Q14 fixed point)");
+    TT_FATAL(t.cgrid.dtype() == t.grid.dtype(), "cgrid must match the grid dtype");
     TT_FATAL(t.index.dtype() == DataType::UINT32, "index must be UINT32");
     TT_FATAL(t.flags.dtype() == DataType::BFLOAT16, "flags must be BFLOAT16");
     TT_FATAL(t.grid.layout() == Layout::ROW_MAJOR, "grid must be ROW_MAJOR");
@@ -62,9 +64,23 @@ void grid_compact(
     for (int i = 0; i < gs.rank() - 1; i++) {
         num_rows *= gs[i];
     }
-    uint32_t thr_x_bits = 0, thr_y_bits = 0;
-    std::memcpy(&thr_x_bits, &threshold_x, sizeof(thr_x_bits));
-    std::memcpy(&thr_y_bits, &threshold_y, sizeof(thr_y_bits));
+    // The kernel compares Q14 fixed point, so the threshold becomes an integer. Round it
+    // UP: the test is a strict `<`, and rounding down would move the boundary inwards and
+    // drop rows whose only in-bounds point sits between two representable coordinates.
+    constexpr int32_t GRID_FIXED_SHIFT = 14;  // must match kps_project_fused and grid_sample
+    auto to_fixed_ceil = [](float v) -> uint32_t {
+        const float s = v * (float)(1 << GRID_FIXED_SHIFT);
+        int32_t q = (int32_t)s;
+        if ((float)q < s) {
+            q += 1;
+        }
+        if (q > 32767) {
+            q = 32767;
+        }
+        return (uint32_t)q;
+    };
+    const uint32_t thr_x_bits = to_fixed_ceil(threshold_x);
+    const uint32_t thr_y_bits = to_fixed_ceil(threshold_y);
 
     using Op = GridCompactOperation;
     ttnn::device_operation::launch<Op>(

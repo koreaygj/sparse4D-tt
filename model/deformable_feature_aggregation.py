@@ -892,9 +892,12 @@ class DeformableFeatureAggregation:
             # Rows past a camera's kept count are never written, so seed them far out
             # of bounds: grid_sample still samples them (their index entry is SENTINEL,
             # so transposed_s2i discards the result) and must not read a stale NaN.
+            # Q14 fixed point in a uint16 container, matching kps_project_fused. The seed
+            # is the saturated value, which decodes to just under 2.0 — far outside the
+            # bounds test, so a slot that is never written can only ever be discarded.
             self._cgrid = ttnn.from_torch(
-                torch.full((1, self._oob_cap, 1, self.num_pts * 2), 9.0),
-                dtype=ttnn.float32, **_kw,
+                torch.full((1, self._oob_cap, 1, self.num_pts * 2), 32767, dtype=torch.int32),
+                dtype=ttnn.uint16, **_kw,
             )
             self._cindex = ttnn.from_torch(
                 torch.zeros(1, 1, 1, self._oob_cap, dtype=torch.int32),
@@ -970,9 +973,17 @@ class DeformableFeatureAggregation:
         )
 
         # 2. Pre-rotation key points + fused KPS projection (overlaps with weight compute on device)
+        # Key points stay bf16: the kernel reads them as bf16 pages, and they are OFFSETS
+        # of object size (1-5 m) rather than positions, so their absolute error is an order
+        # of magnitude below the centre's. Only the anchor keeps the extra width.
+        anchor_bf16 = anchor
+        if anchor.dtype != ttnn.bfloat16:
+            anchor_bf16 = ttnn.typecast(anchor, ttnn.bfloat16)
         key_points = self._kps_generator_pre_rotation(
-            anchor, instance_feature, bs, num_anchor
+            anchor_bf16, instance_feature, bs, num_anchor
         )
+        if anchor_bf16 is not anchor:
+            ttnn.deallocate(anchor_bf16)
         # the kernel reads the anchor as row-major pages
         anchor_rm = ttnn.reshape(anchor, (n, 1, 11))
         anchor_rm = ttnn.to_layout(anchor_rm, ttnn.ROW_MAJOR_LAYOUT)
