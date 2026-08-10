@@ -312,7 +312,7 @@ class DeformableFeatureAggregation:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_bias(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move bias tensor to device as [1, 1, 1, N] in TILE layout."""
@@ -321,7 +321,7 @@ class DeformableFeatureAggregation:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
     def _to_device_1d(self, tensor: torch.Tensor) -> ttnn.Tensor:
         """Move 1D tensor (LayerNorm weight/bias) to device as [1, 1, 1, N]."""
@@ -330,7 +330,7 @@ class DeformableFeatureAggregation:
         kwargs = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
         if self._mesh_device is not None:
             kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
-        return ttnn.from_torch(tensor.float(), **kwargs)
+        return ttnn.from_torch(tensor.bfloat16(), **kwargs)
 
 
     # === Fallback methods (pure ttnn ops, no custom kernels) ===
