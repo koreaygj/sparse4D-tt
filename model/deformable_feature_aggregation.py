@@ -503,6 +503,10 @@ class DeformableFeatureAggregation:
             camera_embed: [bs, num_cams, 256] on device (TILE)
         """
         # Extract first 3 rows of 4x4: [bs, num_cams, 3, 4] -> [bs, num_cams, 12]
+        # The matrix is fp32 for the projection kernel's sake; this path is a matmul chain
+        # whose error never reaches a pixel, so it takes the bf16 view.
+        if projection_mat.dtype != ttnn.bfloat16:
+            projection_mat = ttnn.typecast(projection_mat, ttnn.bfloat16)
         cam_input = ttnn.slice(projection_mat, [0, 0, 0, 0], [bs, self.num_cams, 3, 4])
         cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
 
@@ -820,6 +824,10 @@ class DeformableFeatureAggregation:
             camera_embed: [bs, num_cams, 256] on device (TILE)
         """
         # Extract first 3 rows of 4x4: [bs, num_cams, 3, 4] -> [bs, num_cams, 12]
+        # The matrix is fp32 for the projection kernel's sake; this path is a matmul chain
+        # whose error never reaches a pixel, so it takes the bf16 view.
+        if projection_mat.dtype != ttnn.bfloat16:
+            projection_mat = ttnn.typecast(projection_mat, ttnn.bfloat16)
         cam_input = ttnn.slice(projection_mat, [0, 0, 0, 0], [bs, self.num_cams, 3, 4])
         cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
 

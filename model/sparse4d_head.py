@@ -321,11 +321,18 @@ class Sparse4DHead:
             num_temp = 0
 
         # 3. Pre-allocate projection_mat and image_wh on device
+        # The projection matrix stays fp32. Its entries reach 667, so bf16's relative
+        # precision becomes 1.3 of absolute error there, and the DFA's kernel multiplies a
+        # 3D point by it and divides by depth — measured, that is 0.172 px of sampling-grid
+        # error on the finest FPN level, the single largest term in the grid's disagreement
+        # with PyTorch and twice what the anchor centre contributed. It is [6, 4, 4] = 384 B
+        # and never accumulates, so the width is free; only the camera encoder, which is a
+        # matmul chain that never reaches a pixel, takes a bf16 view of it.
         proj_pt = metas["projection_mat"].float()
         if self._mesh_device is not None:
             proj_tt = ttnn.from_torch(
                 proj_pt,
-                layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
                 mesh_mapper=ttnn.ShardTensorToMesh(self._mesh_device, dim=1),
             )
             # image_wh is constant across frames — cache on device
@@ -339,7 +346,7 @@ class Sparse4DHead:
             wh_tt = self._cached_wh_tt
         else:
             proj_tt = ttnn.from_torch(
-                proj_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16,
+                proj_pt, layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.float32,
             )
             if not hasattr(self, '_cached_wh_tt') or self._cached_wh_tt is None:
                 wh_pt = metas["image_wh"].float()
