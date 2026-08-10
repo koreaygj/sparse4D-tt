@@ -940,14 +940,47 @@ class DeformableFeatureAggregation:
         if return_logits:
             return weights  # pre-softmax logits
 
-        weights = ttnn.softmax(
-            weights,
-            dim=1,
-            numeric_stable=True,
-            compute_kernel_config=self._hifi_compute_config,
-        )
+        if self._mesh_device is not None:
+            # Same subset problem as _softmax_clp, and stock softmax gives no access to
+            # its denominator, so the reduction is written out.
+            weights = self._softmax_clp_dense(weights)
+        else:
+            weights = ttnn.softmax(
+                weights,
+                dim=1,
+                numeric_stable=True,
+                compute_kernel_config=self._hifi_compute_config,
+            )
 
         return weights
+
+    def _softmax_clp_dense(self, logits):
+        """Softmax over dim 1 of [N, CLP, G], denominator reduced across the mesh.
+
+        The compact path needs 0/1 matmuls because its CLP axis is strided inside the row;
+        here the axis is a real one, so ttnn's own reductions do the local part and all
+        that is added is the two cross-device sums. See _softmax_clp for why the shift is
+        reduced as well — exp(l - m0) and exp(l - m1) cannot be added.
+        """
+        cc = dict(num_links=1, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                  topology=ttnn.Topology.Linear)
+        m = ttnn.max(logits, dim=1, keepdim=True)
+        tot = ttnn.all_reduce(m, **cc)
+        ttnn.deallocate(m)
+        m = ttnn.multiply(tot, 1.0 / self._mesh_device.get_num_devices())
+        ttnn.deallocate(tot)
+        shifted = ttnn.subtract(logits, m)
+        ttnn.deallocate(m)
+        e = ttnn.exp(shifted)
+        ttnn.deallocate(shifted)
+
+        s = ttnn.sum(e, dim=1, keepdim=True)
+        red = ttnn.all_reduce(s, **cc)
+        ttnn.deallocate(s)
+        w = ttnn.divide(e, red)
+        ttnn.deallocate(e)
+        ttnn.deallocate(red)
+        return w
 
     def _softmax_clp(self, logits):
         """Softmax over the CLP entries while they stay strided by G inside each row.
@@ -962,8 +995,31 @@ class DeformableFeatureAggregation:
         strided reduction being avoided. It is looser by whatever spread there is between
         groups in a row; debug/probe_clp_softmax.py measures that spread against the
         exponent range so the looseness stays checkable rather than assumed.
+
+        On a mesh the softmax is NOT local. Each device holds its own cameras, so its CLP
+        axis is a subset of the one the softmax is defined over — 156 of 312 on a 3/3
+        split — and normalising over the subset makes each device's weights sum to 1 on
+        their own, so the all_reduce after the fusion adds two complete distributions
+        instead of one. Measured, that alone is the whole of the DFA's error: replaying
+        the per-device normalisation on exact reference logits reproduces PCC 0.952, and
+        scoring the device against a per-device reference gives 0.999989. So the
+        denominator is reduced across devices here.
+
+        The shift has to be reduced with it. exp(l - m0) and exp(l - m1) are not summable,
+        so both devices must subtract the same constant; any common constant is exact, and
+        the mean of the per-device maxima is one both can reach with the Sum all_reduce
+        this file already uses. It sits within half the spread of the true global maximum,
+        which is what stabilisation actually needs.
         """
         m = ttnn.max(logits, dim=-1, keepdim=True)
+        if self._mesh_device is not None:
+            tot = ttnn.all_reduce(
+                m, num_links=1, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=ttnn.Topology.Linear,
+            )
+            ttnn.deallocate(m)
+            m = ttnn.multiply(tot, 1.0 / self._mesh_device.get_num_devices())
+            ttnn.deallocate(tot)
         shifted = ttnn.subtract(logits, m)
         ttnn.deallocate(m)
         e = ttnn.exp(shifted)
@@ -971,6 +1027,14 @@ class DeformableFeatureAggregation:
 
         s = ttnn.matmul(e, self._clp_gather,
                         compute_kernel_config=self._exact_compute_config)
+        if self._mesh_device is not None:
+            # The gather's padding columns are zero on every device, so they stay zero.
+            red = ttnn.all_reduce(
+                s, num_links=1, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=ttnn.Topology.Linear,
+            )
+            ttnn.deallocate(s)
+            s = red
         sb = ttnn.matmul(s, self._clp_scatter,
                          compute_kernel_config=self._exact_compute_config)
         ttnn.deallocate(s)
