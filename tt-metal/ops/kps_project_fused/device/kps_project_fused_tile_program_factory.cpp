@@ -4,7 +4,7 @@
 // 3-kernel TILE-based program factory for kps_project_fused
 // Reader: construct rotation/projection tiles from ROW_MAJOR inputs
 // Compute: matmul_tiles for rotation and projection (FPU)
-// Writer: scalar perspective divide + grid normalize
+// Writer: subtracts the normalise offset and casts to Q14 (the divide moved to the SFPU)
 
 #include <cstdint>
 #include "tt-metalium/work_split.hpp"
@@ -41,7 +41,11 @@ KpsProjectFusedTileProgramFactory::cached_program_t KpsProjectFusedTileProgramFa
     const uint32_t anchor_page_size = tt::round_up(11 * anc_elem, align);
     const uint32_t proj_page_size = tt::round_up(4 * sizeof(float), align);
     const uint32_t wh_page_size = tt::round_up(2 * sizeof(float), align);
-    const uint32_t out_page_size = tt::round_up(num_pts * 2 * sizeof(float), align);
+    // From the output tensor, not sizeof(float): the grid is Q14 in a UINT16 container, so
+    // hardcoding 4 bytes writes twice the page and lands the next anchor's row on top of
+    // the previous one.
+    const uint32_t out_page_size =
+        tt::round_up(num_pts * 2 * output_tensor.element_size(), align);
 
     // TILE sizes
     const uint32_t bf16_tile_size = 2048;  // 32×32 × 2 bytes
@@ -75,6 +79,13 @@ KpsProjectFusedTileProgramFactory::cached_program_t KpsProjectFusedTileProgramFa
     // CB7: intermediate homogeneous TILE f32 (used by compute kernel)
     create_cb(cb_idx++, program, all_cores, f32_tile_size, 1, f32_df);
 
+    // CB8/CB9: the perspective divide's two stages. Separate buffers because
+    // mul_tiles_bcast_cols reads both the raw tile and its reciprocal as operands.
+    create_cb(tt::CBIndex::c_8, program, all_cores, f32_tile_size, 1, f32_df);
+    create_cb(tt::CBIndex::c_9, program, all_cores, f32_tile_size, 1, f32_df);
+    // Depth-floor constant, built once by the reader.
+    create_cb(tt::CBIndex::c_10, program, all_cores, f32_tile_size, 1, f32_df);
+
     // CB16: projected output TILE f32
     const auto [cb_out, _out] = create_cb(tt::CBIndex::c_16, program, all_cores, f32_tile_size, 1, f32_df);
 
@@ -93,6 +104,11 @@ KpsProjectFusedTileProgramFactory::cached_program_t KpsProjectFusedTileProgramFa
         nc, num_pts,
         kp_page_size, anchor_page_size, proj_page_size, wh_page_size,
         bf16_tile_size, f32_tile_size,
+        // The head stores the anchor fp32 — it is a residual stream and accumulates
+        // absolute error. This path still folds it into a bf16 rotation tile for the FPU,
+        // but it has to READ the width it was given or it decodes float bits as bf16.
+        // Appended before the accessor args so their offsets stay contiguous after it.
+        static_cast<uint32_t>(t.anchor.dtype() == DataType::FLOAT32 ? 1 : 0),
     };
     TensorAccessorArgs(*t.key_points.buffer()).append_to(reader_ct_args);
     TensorAccessorArgs(*t.anchor.buffer()).append_to(reader_ct_args);
