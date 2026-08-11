@@ -1245,6 +1245,7 @@ def main():
         raw_outputs = []  # For --save-raw
         total_time = 0
         processed = 0
+        frame_ms = []          # per-frame model.forward, for the median/p90 report
 
         # Process scene by scene for temporal coherence
         for scene_idx, scene_samples in enumerate(loader.scenes):
@@ -1261,6 +1262,7 @@ def main():
                 outputs = model.forward(images, metas, bs=1)
                 elapsed = time.time() - t0
                 total_time += elapsed
+                frame_ms.append(elapsed * 1e3)
                 processed += 1
 
                 # Save raw outputs if requested
@@ -1307,20 +1309,39 @@ def main():
                     gc.collect()
 
                 if processed % 50 == 0 or processed == total_samples:
-                    avg_time = total_time / processed
+                    # Milliseconds to one decimal, not seconds to two. On the old grid a
+                    # sample landed in a 10 ms bucket, which is coarser than most of the
+                    # optimisations this script is used to judge — a 4 ms win reads as no
+                    # change at all. The steady-state median matters more than the mean,
+                    # which stays skewed for hundreds of frames by kernel compilation, so
+                    # both are printed.
+                    warm = sorted(frame_ms[10:]) or sorted(frame_ms)
+                    med = warm[len(warm) // 2]
                     print(
                         f"  [{processed}/{total_samples}] "
-                        f"{elapsed:.2f}s/sample, "
-                        f"avg {avg_time:.2f}s, "
+                        f"{elapsed * 1e3:6.1f} ms  "
+                        f"median {med:6.1f}  "
+                        f"mean {1e3 * total_time / processed:6.1f}  "
+                        f"{1000.0 / med:5.2f} FPS  "
                         f"{len(dets)} dets"
                     )
 
             if processed >= total_samples:
                 break
 
-        avg_time = total_time / max(1, processed)
+        # Report the distribution, not one number. The mean carries the cold frames, the
+        # median is what the model actually runs at, and p90/max are where a scene with an
+        # unusually busy frame shows up — anchors surviving the OOB compaction vary enough
+        # by scene that a single figure hides it.
+        warm = sorted(frame_ms[10:]) or sorted(frame_ms)
+        n = len(warm)
+        med = warm[n // 2]
         print(
-            f"\n  Inference complete: {processed} samples, avg {avg_time:.2f}s/sample"
+            f"\n  Inference complete: {processed} samples"
+            f"\n    median {med:.1f} ms  ({1000.0 / med:.2f} FPS)"
+            f"\n    mean   {1e3 * total_time / max(1, processed):.1f} ms"
+            f"   (includes {min(10, len(frame_ms))} cold frames)"
+            f"\n    min {warm[0]:.1f}   p90 {warm[int(0.9 * n) - 1]:.1f}   max {warm[-1]:.1f}"
         )
 
         # Save raw outputs if requested
