@@ -13,6 +13,8 @@ import argparse
 import copy
 import gc
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -170,33 +172,111 @@ def make_frame(raw_imgs, bboxes3d, proj_mats, cls_indices, scores, frame_idx, el
         rows.append(np.concatenate(cols, axis=1))
 
     canvas = np.concatenate(rows, axis=0)
-
-    # Info bar
-    info_h = 50
-    info_bar = np.zeros((info_h, canvas.shape[1], 3), dtype=np.uint8)
     num_det = len(bboxes3d)
 
-    cv2.putText(
-        info_bar,
-        f"Frame {frame_idx:04d}  |  Detections: {num_det}  |  TT-NN {elapsed_ms:.0f}ms  |  Sparse4D N300 Mesh SPMD",
-        (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA,
-    )
+    # Info bar, sized from the canvas width rather than fixed. The canvas is 4224 px wide,
+    # and H.264 tops out at 4096, so the video has to be downscaled to 1920 to play
+    # anywhere — which took a fixed 50 px bar down to 23 px and made it unreadable. Scaling
+    # with the width keeps it legible at whatever size the video ends up.
+    cls_counts = {}
+    for c in cls_indices[:num_det]:
+        name = CLASS_NAMES[c] if c < len(CLASS_NAMES) else "?"
+        cls_counts[name] = cls_counts.get(name, 0) + 1
 
-    if num_det > 0:
-        cls_counts = {}
-        for c in cls_indices:
-            name = CLASS_NAMES[c] if c < len(CLASS_NAMES) else "?"
-            cls_counts[name] = cls_counts.get(name, 0) + 1
-        x_offset = canvas.shape[1] // 2
-        for name, cnt in cls_counts.items():
-            color = CLASS_COLORS.get(name, (0, 255, 0))
-            text = f"{name}: {cnt}"
-            cv2.putText(info_bar, text, (x_offset, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-            x_offset += len(text) * 12 + 20
-
-    canvas = np.concatenate([canvas, info_bar], axis=0)
+    canvas = np.concatenate([canvas, _info_bar(
+        canvas.shape[1],
+        f"Frame {frame_idx:04d}  |  Detections: {num_det}  |  TT-NN {elapsed_ms:.0f}ms"
+        f"  |  Sparse4D N300 Mesh SPMD",
+        cls_counts,
+    )], axis=0)
     return canvas
+
+
+class _FfmpegWriter:
+    """Pipe raw frames to ffmpeg instead of encoding through OpenCV.
+
+    Two things made the OpenCV path produce files that show as green on macOS. Most cv2
+    wheels ship without an x264 encoder, so `avc1` fails to open and the old code fell
+    through to `mp4v` — MPEG-4 Part 2, which Apple will not decode inside an .mp4. And the
+    canvas is 4224 px wide, past the 4096 ceiling every H.264 level up to 5.1 sets, so even
+    a correct stream at full width fails on Apple's hardware decoder. Hence the downscale.
+    """
+
+    def __init__(self, path, w, h, fps, max_width=1920, crf=20):
+        ow = min(w, max_width)
+        oh = int(round(h * ow / w))
+        ow -= ow % 2                      # yuv420p subsamples 2x2, so both must be even
+        oh -= oh % 2
+        self.size = (ow, oh)
+        self.proc = subprocess.Popen(
+            ["ffmpeg", "-y", "-v", "error",
+             "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps),
+             "-i", "-",
+             "-vf", f"scale={ow}:{oh}:flags=lanczos",
+             "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
+             "-pix_fmt", "yuv420p", "-preset", "medium", "-crf", str(crf),
+             "-movflags", "+faststart", "-an", path],
+            stdin=subprocess.PIPE,
+        )
+
+    def write(self, frame_bgr):
+        self.proc.stdin.write(np.ascontiguousarray(frame_bgr).tobytes())
+
+    def release(self):
+        self.proc.stdin.close()
+        self.proc.wait()
+
+
+def _open_writer(path, w, h, fps, max_width, crf):
+    if shutil.which("ffmpeg") is None:
+        # Still better than nothing, but say plainly what the file will and will not play in.
+        print("  WARNING: ffmpeg not found — falling back to OpenCV mp4v. "
+              "The file will not play on macOS; re-encode with ffmpeg before sharing.")
+        return cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    wr = _FfmpegWriter(path, w, h, fps, max_width, crf)
+    note = "" if wr.size == (w, h) else f" (from {w}x{h}, H.264 caps width at 4096)"
+    print(f"  Video: {wr.size[0]}x{wr.size[1]}{note}, {fps} fps, h264/yuv420p -> {path}")
+    return wr
+
+
+def _info_bar(width, main, cls_counts):
+    """Bottom bar: one full-width status line, class counts on a second line."""
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    pad = max(10, width // 240)
+
+    # Grow the status line to fill the width, with a ceiling so a short line does not turn
+    # into a banner. Measuring at scale 1.0 gives the exact scale that fits.
+    (mw, _), _ = cv2.getTextSize(main, FONT, 1.0, 2)
+    fs = min(width / 1600.0, (width - 2 * pad) / max(mw, 1))
+    th = max(2, round(fs * 2.2))
+    fs2 = fs * 0.78
+    th2 = max(1, round(fs2 * 2.0))
+
+    # The second line is always reserved, even on a frame with no detections: an encoder
+    # gets one frame size for the whole video, and a bar that shrinks when the class counts
+    # are empty changes the canvas height mid-run.
+    line1 = int(fs * 46)
+    line2 = int(fs2 * 46)
+    # Rounded to a multiple of 16 so the finished canvas is too: x264's macroblocks are
+    # 16x16, and imageio silently resizes anything else, which is a second way for the
+    # frame size to drift.
+    bar_h = line1 + line2 + pad
+    bar_h += -bar_h % 16
+    bar = np.zeros((bar_h, width, 3), dtype=np.uint8)
+
+    cv2.putText(bar, main, (pad, int(line1 * 0.76)), FONT, fs, (0, 255, 0), th, cv2.LINE_AA)
+
+    x, y = pad, line1 + int(line2 * 0.76)
+    gap = int(fs2 * 18)
+    for name, cnt in cls_counts.items():
+        text = f"{name}: {cnt}"
+        (tw, _), _ = cv2.getTextSize(text, FONT, fs2, th2)
+        if x + tw > width - pad:      # measured advance, so the row never runs off the edge
+            break
+        cv2.putText(bar, text, (x, y), FONT, fs2,
+                    CLASS_COLORS.get(name, (0, 255, 0)), th2, cv2.LINE_AA)
+        x += tw + gap
+    return bar
 
 
 def decode_outputs(outputs, conf_threshold=0.3, mesh_device=None):
@@ -260,6 +340,11 @@ def main():
     parser.add_argument("--outdir", type=str, default="inference_output", help="output dir for images mode")
     parser.add_argument("--output", type=str, default="inference_video_tt.mp4", help="output video path")
     parser.add_argument("--fps", type=int, default=4, help="video fps (default: 4)")
+    parser.add_argument("--max-width", type=int, default=1920,
+                        help="downscale wider frames to this (default: 1920). H.264 caps "
+                             "width at 4096 and the raw canvas is 4224")
+    parser.add_argument("--crf", type=int, default=20,
+                        help="x264 quality, lower is better (default: 20)")
     parser.add_argument("--ckpt", type=str, default="ckpt/latest.pth", help="checkpoint path")
     parser.add_argument("--data-root", type=str, default="nuscenes/trainval", help="nuScenes data root")
     parser.add_argument("--anno-pkl", type=str, default="nuscenes_anno_pkls/nuscenes_infos_val.pkl")
@@ -359,22 +444,8 @@ def main():
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 if writer is None:
                     h, w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"avc1")
-                    writer = cv2.VideoWriter(args.output, fourcc, args.fps, (w, h))
-                    if not writer.isOpened():
-                        # Fallback: try x264 or mp4v if avc1 not available
-                        for codec in ["x264", "H264", "mp4v"]:
-                            fourcc = cv2.VideoWriter_fourcc(*codec)
-                            writer = cv2.VideoWriter(args.output, fourcc, args.fps, (w, h))
-                            if writer.isOpened():
-                                print(f"  Video: {w}x{h}, {args.fps} fps, codec={codec} -> {args.output}")
-                                break
-                        if not writer.isOpened():
-                            print(f"  WARNING: No H.264 encoder found, falling back to mp4v")
-                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                            writer = cv2.VideoWriter(args.output, fourcc, args.fps, (w, h))
-                    else:
-                        print(f"  Video: {w}x{h}, {args.fps} fps, codec=h264 -> {args.output}")
+                    writer = _open_writer(args.output, w, h, args.fps,
+                                          args.max_width, args.crf)
                 writer.write(frame_bgr)
 
             max_score = scores.max() if len(scores) > 0 else 0
