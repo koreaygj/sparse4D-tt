@@ -93,6 +93,19 @@ if _env is not None:
 else:
     _WT_COMPACT = _HAS_CUSTOM_KERNELS
 
+# kps_project_fused has two program factories. The default one does the rotation and the
+# projection in software fp32 on the dataflow cores, which have no FPU; the tile one builds
+# bf16 tiles and lets the FPU do both matmuls. Profiling put the scalar path at 17.4 ms of a
+# 91 ms frame, the single largest op.
+#
+# Full val decided it, 6019 samples: 90.56 -> 81.67 ms (11.04 -> 12.24 FPS) for NDS
+# 0.5534 -> 0.5517. mAP does not move (0.44756 -> 0.44733, noise) — the cost lands entirely
+# on localisation, mATE +0.0088 and mAOE +0.0049, which is exactly what a coarser projection
+# should touch and nothing else. 9.8% of the frame for 0.3% of NDS.
+#
+# TT_KPS_TILE=0 restores the fp32 path when localisation accuracy matters more than latency.
+_KPS_TILE = _os.environ.get("TT_KPS_TILE", "1") == "1"
+
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -1219,6 +1232,7 @@ class DeformableFeatureAggregation:
                 self._cached_proj_rm, self._cached_wh_rm,
                 num_cams=nc, num_pts=self.num_pts,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                use_tile_compute=_KPS_TILE,
             )
             ttnn.deallocate(key_points)
             ttnn.deallocate(anchor_rm)
