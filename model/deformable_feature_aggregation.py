@@ -785,15 +785,29 @@ class DeformableFeatureAggregation:
             ):
                 self._cached_camera_embed = self._camera_encoder(projection_mat, bs)
             camera_embed = self._cached_camera_embed
-            feat_exp = ttnn.reshape(feature, (bs, num_anchor, 1, self.embed_dims))
-            cam_exp = ttnn.reshape(
-                camera_embed, (bs, 1, self.num_cams, self.embed_dims)
-            )
-            feature = ttnn.add(feat_exp, cam_exp)
+            # Materialise both operands at [1, 1, N*nc, C] instead of letting a broadcast
+            # do it from [N, 1, C] and [1, nc, C].
+            #
+            # The broadcast form is the obvious one and it is the expensive one: 1 and nc
+            # land in the tile axis, which pads to 32, so a 1.3 MB answer is computed
+            # through a 14 MB intermediate — 91% of the tiles carry nothing. Profiled, the
+            # reshape in, the add and the reshape out came to 3.93 ms/frame between them.
+            #
+            # repeat_interleave on the anchors and repeat on the cameras cost two extra ops
+            # but leave every axis tile-aligned, and the add itself then has no broadcast.
+            # Measured on the real shapes: 882 -> 515 us per call.
+            #
+            # The row order is load-bearing. repeat_interleave gives anchor-major and repeat
+            # cycles the cameras fastest, which is exactly the (anchor, camera) ordering the
+            # reshape after the linear relies on to read clp = cam*L*K + level*K + point.
+            feat_flat = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
+            cam_flat = ttnn.reshape(camera_embed, (1, 1, self.num_cams, self.embed_dims))
+            f_rep = ttnn.repeat_interleave(feat_flat, self.num_cams, dim=2)
+            c_rep = ttnn.repeat(cam_flat, ttnn.Shape([1, 1, bs * num_anchor, 1]))
+            feature = ttnn.add(f_rep, c_rep)
+            ttnn.deallocate(f_rep)
+            ttnn.deallocate(c_rep)
             # Don't deallocate camera_embed — it's cached for reuse
-            feature = ttnn.reshape(
-                feature, (1, 1, bs * num_anchor * self.num_cams, self.embed_dims)
-            )
         else:
             feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
 
