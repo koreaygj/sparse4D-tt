@@ -141,7 +141,11 @@ void kernel_main() {
 
     // image_wh, read once: it is a per-camera constant and it now folds into the projection
     // matrix rather than being applied per point in the writer.
-    float inv_w[8], inv_h[8];
+    //
+    // Sized by NC rather than a fixed bound. NC is a compile-time argument, so there is no
+    // reason to guess a maximum — and guessing one is how an out-of-range camera count
+    // becomes a silent L1 overwrite instead of a compile error.
+    float inv_w[NC], inv_h[NC];
     {
         const uint32_t wh_scratch = data_scratch;
         for (uint32_t c = 0; c < NC; c++) {

@@ -220,11 +220,23 @@ class _FfmpegWriter:
         )
 
     def write(self, frame_bgr):
-        self.proc.stdin.write(np.ascontiguousarray(frame_bgr).tobytes())
+        # A dead encoder shows up here as a broken pipe. Turn it into the reason rather than
+        # a bare traceback several hundred frames from where it started.
+        try:
+            self.proc.stdin.write(np.ascontiguousarray(frame_bgr).tobytes())
+        except BrokenPipeError:
+            raise RuntimeError(
+                f"ffmpeg exited early (code {self.proc.poll()}) — its stderr is above"
+            ) from None
 
     def release(self):
+        # Check the exit status. This whole class exists because the previous writer failed
+        # silently and left a file that would not play; ignoring ffmpeg's return code would
+        # reintroduce exactly that, just one layer down.
         self.proc.stdin.close()
-        self.proc.wait()
+        rc = self.proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg exited with code {rc}; the video is incomplete")
 
 
 def _open_writer(path, w, h, fps, max_width, crf):

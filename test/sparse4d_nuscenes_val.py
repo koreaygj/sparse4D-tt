@@ -1334,15 +1334,21 @@ def main():
         # unusually busy frame shows up — anchors surviving the OOB compaction vary enough
         # by scene that a single figure hides it.
         warm = sorted(frame_ms[10:]) or sorted(frame_ms)
-        n = len(warm)
-        med = warm[n // 2]
-        print(
-            f"\n  Inference complete: {processed} samples"
-            f"\n    median {med:.1f} ms  ({1000.0 / med:.2f} FPS)"
-            f"\n    mean   {1e3 * total_time / max(1, processed):.1f} ms"
-            f"   (includes {min(10, len(frame_ms))} cold frames)"
-            f"\n    min {warm[0]:.1f}   p90 {warm[int(0.9 * n) - 1]:.1f}   max {warm[-1]:.1f}"
-        )
+        if not warm:
+            # --num-samples 0, or the run stopped before a frame completed. Saying so beats
+            # an IndexError out of the timing report, which would look like the inference
+            # failed rather than never having started.
+            print(f"\n  Inference complete: {processed} samples, no timings recorded")
+        else:
+            n = len(warm)
+            p90 = warm[min(n - 1, int(0.9 * n))]
+            print(
+                f"\n  Inference complete: {processed} samples"
+                f"\n    median {warm[n // 2]:.1f} ms  ({1000.0 / warm[n // 2]:.2f} FPS)"
+                f"\n    mean   {1e3 * total_time / max(1, processed):.1f} ms"
+                f"   (includes {min(10, len(frame_ms))} cold frames)"
+                f"\n    min {warm[0]:.1f}   p90 {p90:.1f}   max {warm[-1]:.1f}"
+            )
 
         # Save raw outputs if requested
         if args.save_raw and raw_outputs:
