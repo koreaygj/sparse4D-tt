@@ -9,8 +9,8 @@ Headline results live in the [README](../README.md); this file records how they 
 
 ## v3
 
-Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4476**, NDS 0.5186 ->
-**0.5534**, mATE 0.5947 -> **0.5532**. Latency 90.7 ms/sample.
+Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4480**, NDS 0.5186 ->
+**0.5520**. Latency 90.7 -> **77.7 ms/sample** (11.02 -> 12.86 FPS).
 
 ### Accuracy
 
@@ -68,9 +68,47 @@ Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4476**, NDS 0.51
 - ReshapeView 11.84 -> 8.39, Transpose 1.90 -> 0.10, Softmax 0.83 -> 0.00 ms/frame
 - Net **-4.39 ms/frame**
 
+**`1a3a707` / `de99ca8` — kps_project_fused on the tile path, then its divide on the SFPU**
+
+The op was 17.4 ms of a 91 ms frame, the single largest, and ran entirely on dataflow cores
+that have no FPU. Two stages:
+
+- *Tile path.* A tile program factory already existed but was unreachable — three things had
+  drifted from the scalar path and would have produced silently wrong output: the writer
+  emitted f32 into a Q14 `UINT16` page, `out_page_size` hardcoded `sizeof(float)` and
+  overwrote the next anchor's row, and the reader read the anchor as bf16 after the head
+  started storing it fp32. Fixed, the rotation and projection run as FPU matmuls:
+  **90.56 -> 81.67 ms/frame**
+- *SFPU divide.* The writer still did a perspective divide, normalise, clamp and Q14 convert
+  per point in soft float. A probe that skipped exactly that chain priced it at **73% of the
+  op**. The reader now reorders `P` so depth is in column 0 — the only column
+  `mul_tiles_bcast_cols` can broadcast — and pre-scales the x/y rows by `2*2^14/W` and
+  `2*2^14/H`, folding the normalise and the Q14 conversion into the matmul at no extra
+  matmul. The compute kernel floors depth against a constant tile, takes the reciprocal on
+  the SFPU, and multiplies by the broadcast. **kps 19.61 -> 3.85 ms/frame, e2e 81.67 ->
+  77.7 ms**
+
+Two things were deliberately left alone, both for numerical reasons:
+
+- The `-1` offset is not folded into the matrix. It would make the numerator `s*px - o*pz`,
+  a difference of two nearly equal numbers wherever a point lands near the image centre, and
+  this path's grid error is already 100x the scalar one. Subtracting it in the writer is one
+  instruction
+- The depth floor (`max(pz, 1e-5)`) is not optional and cost a debugging round. Without it a
+  point behind the camera has `pz <= 0`, the reciprocal is negative, and `px/pz` returns
+  sign-flipped at a plausible magnitude — an in-bounds sample of the wrong pixel rather than
+  an out-of-bounds one. Grid PCC does not catch it, because that metric compares in-bounds
+  points only; the DFA output does, at 0.789
+
+Accuracy across the two stages: mAP 0.44756 -> 0.44733 -> **0.44802**, i.e. unchanged. The
+cost is localisation only — **mATE 0.5532 -> 0.5620** — because the projection is now bf16
+tile matmuls rather than software fp32. `TT_KPS_TILE=0` restores the fp32 path.
+
 ### Rejected by measurement
 
-Recorded so they are not retried. Baseline mAP 0.4311, 1500 val samples.
+Recorded so they are not retried.
+
+**Precision knobs.** Baseline mAP 0.4311, 1500 val samples.
 
 | Setting | Effect on mAP |
 | :--- | :---: |
@@ -83,6 +121,31 @@ Recorded so they are not retried. Baseline mAP 0.4311, 1500 val samples.
   was wrong: no precision knob repairs a wrong formula
 - Simulating "every intermediate is bf16" in PyTorch (`TorchFunctionMode`) reaches PCC
   0.9928 against the 0.907 that needed explaining — bf16 storage was never the cause
+
+**A device-side precomputed-grid emitter.** This one is worth reading before anyone tries
+it again, because the lever it chases is real and the arithmetic still does not close.
+
+`grid_sample` accepts a precomputed grid: 6 fields per point (pixel coordinates and the four
+bilinear weights) instead of 2 normalised coordinates, which removes the ~928 of ~1494
+cycles its reader spends per point turning one into the other on an FPU-less core. Measured
+on this model's shapes it is **2.78x** — consistent across all four FPN levels, 10.22 ->
+3.68 ms/frame, so **-6.5 ms** is genuinely on the table.
+
+The obstacle is that `ttnn.prepare_grid_sample_grid` runs on the host, and this model's grid
+is produced on device. Emitting the format from a kernel instead does not remove the work,
+it relocates it: the grid is per (point, LEVEL), so four grids are needed and the total is
+unchanged. Priced by adding exactly that math to `grid_compact` — which already holds every
+row in L1 for the bounds test, across 63 cores — and discarding the result: **+38.5
+ms/frame**, six times the prize. Even computing only the rows compaction keeps (25-43%) puts
+it at 9.6-16.6 ms, still above 6.5.
+
+The only surviving variant is doing it on the SFPU, where `kps_project_fused` proved the FPU
+is worth roughly 2x for comparable math. That needs the grid in tiles, and it is ROW_MAJOR
+int16 — the relayout this stack punishes hardest (width-1 assembly measured 71 ms against
+0.4 ms field-major, 178x). Not attempted.
+
+`use_precomputed_grid` itself is upstream, costs nothing when false (`if constexpr`), and is
+left alone. What is closed is the device-side producer, not the feature.
 
 ---
 
