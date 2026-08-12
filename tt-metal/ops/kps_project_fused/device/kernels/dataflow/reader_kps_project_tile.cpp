@@ -104,6 +104,7 @@ void kernel_main() {
     constexpr uint32_t cb_rot      = get_compile_time_arg_val(1);
     constexpr uint32_t cb_center   = get_compile_time_arg_val(2);
     constexpr uint32_t cb_ones     = get_compile_time_arg_val(3);
+    constexpr uint32_t cb_zfloor   = tt::CBIndex::c_10;
     constexpr uint32_t cb_proj     = get_compile_time_arg_val(4);
     constexpr uint32_t NC          = get_compile_time_arg_val(5);
     constexpr uint32_t NUM_PTS     = get_compile_time_arg_val(6);
@@ -114,7 +115,9 @@ void kernel_main() {
     constexpr uint32_t bf16_tile_size  = get_compile_time_arg_val(11);  // 2048
     constexpr uint32_t f32_tile_size   = get_compile_time_arg_val(12);  // 4096
 
-    constexpr auto kp_args = TensorAccessorArgs<13>();
+    constexpr uint32_t ANC_FP32    = get_compile_time_arg_val(13);
+
+    constexpr auto kp_args = TensorAccessorArgs<14>();
     constexpr auto anchor_args = TensorAccessorArgs<kp_args.next_compile_time_args_offset()>();
     constexpr auto proj_args = TensorAccessorArgs<anchor_args.next_compile_time_args_offset()>();
     constexpr auto wh_args = TensorAccessorArgs<proj_args.next_compile_time_args_offset()>();
@@ -135,6 +138,47 @@ void kernel_main() {
     uint32_t zero_src = scratch_base;
     zero_region_volatile(zero_src, 32);
     uint32_t data_scratch = scratch_base + 32;
+
+    // image_wh, read once: it is a per-camera constant and it now folds into the projection
+    // matrix rather than being applied per point in the writer.
+    //
+    // Sized by NC rather than a fixed bound. NC is a compile-time argument, so there is no
+    // reason to guess a maximum — and guessing one is how an out-of-range camera count
+    // becomes a silent L1 overwrite instead of a compile error.
+    float inv_w[NC], inv_h[NC];
+    {
+        const uint32_t wh_scratch = data_scratch;
+        for (uint32_t c = 0; c < NC; c++) {
+            noc_async_read(wh_accessor.get_noc_addr(c), wh_scratch + c * wh_page_size, wh_page_size);
+        }
+        noc_async_read_barrier();
+        volatile tt_l1_ptr float* whp = reinterpret_cast<volatile tt_l1_ptr float*>(wh_scratch);
+        constexpr uint32_t whf = wh_page_size / sizeof(float);
+        for (uint32_t c = 0; c < NC; c++) {
+            inv_w[c] = 1.0f / whp[c * whf + 0];
+            inv_h[c] = 1.0f / whp[c * whf + 1];
+        }
+    }
+
+    // Depth floor tile, constant, pushed once. The perspective divide needs max(pz, 1e-5)
+    // — without it a point behind the camera gives a NEGATIVE reciprocal, and px/pz comes
+    // back with a flipped sign at a plausible magnitude, i.e. an in-bounds coordinate
+    // pointing at the wrong pixel instead of an out-of-bounds one. The scalar writer used
+    // to do this with a ternary; on tiles it is a max against a constant.
+    //
+    // Only column 0 carries depth, so every other column gets -FLT_MAX and the max leaves
+    // it alone — the numerators are legitimately negative and must not be clamped.
+    cb_reserve_back(cb_zfloor, 1);
+    {
+        uint32_t zf_addr = get_write_ptr(cb_zfloor);
+        volatile tt_l1_ptr uint32_t* zf_tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zf_addr);
+        for (uint32_t r = 0; r < 32; r++) {
+            for (uint32_t c2 = 0; c2 < 32; c2++) {
+                tile_set_f32(zf_tile, r, c2, (c2 == 0) ? 1e-5f : -3.0e38f);
+            }
+        }
+    }
+    cb_push_back(cb_zfloor, 1);
 
     // Build ones_col3 tile (constant, pushed once)
     // ones_col3[r][3] = 1.0f for all r, rest = 0
@@ -194,15 +238,29 @@ void kernel_main() {
         noc_async_read_barrier();
         if (!slots_initialized) noc_async_write_barrier();
 
-        // Now process anchor data
-        volatile tt_l1_ptr uint16_t* anc_bf16 = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(anc_scratch);
-        uint16_t cos_yaw_bf16 = anc_bf16[ANC_COS_YAW];
-        uint16_t sin_yaw_bf16 = anc_bf16[ANC_SIN_YAW];
-        uint16_t cx_bf16 = anc_bf16[ANC_X];
-        uint16_t cy_bf16 = anc_bf16[ANC_Y];
-        uint16_t cz_bf16 = anc_bf16[ANC_Z];
-        float neg_sin = -bf16_to_f32(sin_yaw_bf16);
-        uint16_t neg_sin_bf16 = f32_to_bf16(neg_sin);
+        // Now process anchor data. The tile the FPU multiplies is bf16 either way, so the
+        // fp32 case only decides how the value is READ — reading float bits as bf16 gives
+        // the top half of the mantissa dressed as an exponent, which is not a small error.
+        uint16_t cos_yaw_bf16, sin_yaw_bf16, cx_bf16, cy_bf16, cz_bf16;
+        float sin_yaw_f;
+        if constexpr (ANC_FP32) {
+            volatile tt_l1_ptr float* a = reinterpret_cast<volatile tt_l1_ptr float*>(anc_scratch);
+            cos_yaw_bf16 = f32_to_bf16(a[ANC_COS_YAW]);
+            sin_yaw_f    = a[ANC_SIN_YAW];
+            sin_yaw_bf16 = f32_to_bf16(sin_yaw_f);
+            cx_bf16      = f32_to_bf16(a[ANC_X]);
+            cy_bf16      = f32_to_bf16(a[ANC_Y]);
+            cz_bf16      = f32_to_bf16(a[ANC_Z]);
+        } else {
+            volatile tt_l1_ptr uint16_t* a = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(anc_scratch);
+            cos_yaw_bf16 = a[ANC_COS_YAW];
+            sin_yaw_bf16 = a[ANC_SIN_YAW];
+            cx_bf16      = a[ANC_X];
+            cy_bf16      = a[ANC_Y];
+            cz_bf16      = a[ANC_Z];
+            sin_yaw_f    = bf16_to_f32(sin_yaw_bf16);
+        }
+        uint16_t neg_sin_bf16 = f32_to_bf16(-sin_yaw_f);
 
         // Build rotation matrix tile (5 scatter writes)
         tile_set_bf16(rot_tile, 0, 0, cos_yaw_bf16);
@@ -253,11 +311,29 @@ void kernel_main() {
 
             volatile tt_l1_ptr float* pdata = reinterpret_cast<volatile tt_l1_ptr float*>(proj_scratch);
             constexpr uint32_t ppf = proj_page_size / sizeof(float);
-            for (uint32_t row = 0; row < 4; row++) {
-                for (uint32_t col = 0; col < 4; col++) {
-                    float val = pdata[row * ppf + col];
-                    tile_set_f32(proj_tile, col, row, val);
-                }
+            // Column j of the projected tile is (row j of this matrix) . point, so the
+            // matrix is stored transposed: tile[k][j] = c_j[k].
+            //
+            // Two departures from a plain transpose, both to take work off the scalar
+            // writer, which measured 73% of this path:
+            //
+            //   j=0 gets P's z row, so the depth lands in column 0 — the only column
+            //   `mul_tiles_bcast_cols` can broadcast, which is what lets the perspective
+            //   divide happen as one tile op instead of per point in soft float.
+            //
+            //   j=1,2 get P's x,y rows pre-scaled by 2*2^14/W and 2*2^14/H, folding the
+            //   normalise and the Q14 conversion into the matmul. The -1 offset is
+            //   deliberately NOT folded: it would make the numerator s*px - o*pz, a
+            //   difference of two nearly equal numbers wherever a point lands near the
+            //   image centre, and this path's grid error is already 100x the scalar one.
+            //   Subtracting it in the writer is one instruction and carries no such risk.
+            const float sx = 2.0f * 16384.0f * inv_w[c];
+            const float sy = 2.0f * 16384.0f * inv_h[c];
+            for (uint32_t k = 0; k < 4; k++) {
+                tile_set_f32(proj_tile, k, 0, pdata[2 * ppf + k]);
+                tile_set_f32(proj_tile, k, 1, sx * pdata[0 * ppf + k]);
+                tile_set_f32(proj_tile, k, 2, sy * pdata[1 * ppf + k]);
+                tile_set_f32(proj_tile, k, 3, 0.0f);
             }
             cb_push_back(cb_proj, 1);
         }

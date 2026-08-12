@@ -93,6 +93,19 @@ if _env is not None:
 else:
     _WT_COMPACT = _HAS_CUSTOM_KERNELS
 
+# kps_project_fused has two program factories. The default one does the rotation and the
+# projection in software fp32 on the dataflow cores, which have no FPU; the tile one builds
+# bf16 tiles and lets the FPU do both matmuls. Profiling put the scalar path at 17.4 ms of a
+# 91 ms frame, the single largest op.
+#
+# Full val decided it, 6019 samples: 90.56 -> 81.67 ms (11.04 -> 12.24 FPS) for NDS
+# 0.5534 -> 0.5517. mAP does not move (0.44756 -> 0.44733, noise) — the cost lands entirely
+# on localisation, mATE +0.0088 and mAOE +0.0049, which is exactly what a coarser projection
+# should touch and nothing else. 9.8% of the frame for 0.3% of NDS.
+#
+# TT_KPS_TILE=0 restores the fp32 path when localisation accuracy matters more than latency.
+_KPS_TILE = _os.environ.get("TT_KPS_TILE", "1") == "1"
+
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -489,117 +502,6 @@ class DeformableFeatureAggregation:
 
         return points_2d
 
-    def _camera_encoder(
-        self,
-        projection_mat: ttnn.Tensor,
-        bs: int,
-    ) -> ttnn.Tensor:
-        """Camera encoder on device: Linear→ReLU→LN→Linear→ReLU→LN.
-
-        Args:
-            projection_mat: [bs, num_cams, 4, 4] on device
-
-        Returns:
-            camera_embed: [bs, num_cams, 256] on device (TILE)
-        """
-        # Extract first 3 rows of 4x4: [bs, num_cams, 3, 4] -> [bs, num_cams, 12]
-        # The matrix is fp32 for the projection kernel's sake; this path is a matmul chain
-        # whose error never reaches a pixel, so it takes the bf16 view.
-        if projection_mat.dtype != ttnn.bfloat16:
-            projection_mat = ttnn.typecast(projection_mat, ttnn.bfloat16)
-        cam_input = ttnn.slice(projection_mat, [0, 0, 0, 0], [bs, self.num_cams, 3, 4])
-        cam_input = ttnn.reshape(cam_input, (1, 1, bs * self.num_cams, 12))
-
-        # Linear1: [bs*num_cams, 12] -> [bs*num_cams, 256]
-        x = ttnn.linear(cam_input, self.cam_linear1_weight, bias=self.cam_linear1_bias, compute_kernel_config=self._hifi_compute_config)
-        ttnn.deallocate(cam_input)
-        relu_in = x
-        x = ttnn.relu(x)
-        relu_out = x
-        x = ttnn.layer_norm(x, weight=self.cam_ln1_weight, bias=self.cam_ln1_bias, epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
-        ttnn.deallocate(relu_in)
-        ttnn.deallocate(relu_out)
-
-        # Linear2: [bs*num_cams, 256] -> [bs*num_cams, 256]
-        linear2_in = x
-        x = ttnn.linear(x, self.cam_linear2_weight, bias=self.cam_linear2_bias, compute_kernel_config=self._hifi_compute_config)
-        ttnn.deallocate(linear2_in)
-        relu_in = x
-        x = ttnn.relu(x)
-        relu_out = x
-        x = ttnn.layer_norm(x, weight=self.cam_ln2_weight, bias=self.cam_ln2_bias, epsilon=1e-5, compute_kernel_config=self._hifi_compute_config)
-        ttnn.deallocate(relu_in)
-        ttnn.deallocate(relu_out)
-
-        # Reshape to [bs, num_cams, 256]
-        x = ttnn.reshape(x, (bs, self.num_cams, self.embed_dims))
-        return x
-
-    def _get_weights(
-        self,
-        instance_feature: ttnn.Tensor,
-        anchor_embed: ttnn.Tensor,
-        projection_mat: ttnn.Tensor,
-        bs: int,
-        num_anchor: int,
-        return_logits: bool = False,
-    ) -> ttnn.Tensor:
-        """Compute attention weights on device.
-
-        Args:
-            instance_feature: [bs, num_anchor, embed_dims] on device
-            anchor_embed: [bs, num_anchor, embed_dims] on device
-            projection_mat: [bs, num_cams, 4, 4] on device
-
-        Returns:
-            weights: [bs*num_anchor, num_cams*num_levels*num_pts, num_groups] on device
-        """
-        feature = ttnn.add(instance_feature, anchor_embed)  # [bs, num_anchor, 256]
-
-        if self.use_camera_embed:
-            camera_embed = self._camera_encoder(projection_mat, bs)
-            feat_exp = ttnn.reshape(feature, (bs, num_anchor, 1, self.embed_dims))
-            cam_exp = ttnn.reshape(
-                camera_embed, (bs, 1, self.num_cams, self.embed_dims)
-            )
-            feature = ttnn.add(feat_exp, cam_exp)
-            ttnn.deallocate(camera_embed)
-            feature = ttnn.reshape(
-                feature, (1, 1, bs * num_anchor * self.num_cams, self.embed_dims)
-            )
-        else:
-            feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
-
-        weights = ttnn.linear(
-            feature, self.weights_fc_weight, bias=self.weights_fc_bias,
-            compute_kernel_config=self._hifi_compute_config,
-        )
-
-        ttnn.deallocate(feature)
-
-        total_clp = self.num_cams * self.num_levels * self.num_pts
-        if self.use_camera_embed:
-            weights = ttnn.reshape(
-                weights,
-                (1, 1, bs * num_anchor,
-                 self.num_cams * self.num_levels * self.num_pts * self.num_groups),
-            )
-            weights = ttnn.reshape(
-                weights, (bs * num_anchor, total_clp, self.num_groups)
-            )
-        else:
-            weights = ttnn.reshape(
-                weights, (bs * num_anchor, total_clp, self.num_groups)
-            )
-
-        if return_logits:
-            return weights  # pre-softmax logits
-
-        weights = ttnn.softmax(weights, dim=1, numeric_stable=True,
-                               compute_kernel_config=self._hifi_compute_config)
-
-        return weights
-
     def _feature_sampling(
         self,
         feature_maps: List[ttnn.Tensor],
@@ -883,15 +785,29 @@ class DeformableFeatureAggregation:
             ):
                 self._cached_camera_embed = self._camera_encoder(projection_mat, bs)
             camera_embed = self._cached_camera_embed
-            feat_exp = ttnn.reshape(feature, (bs, num_anchor, 1, self.embed_dims))
-            cam_exp = ttnn.reshape(
-                camera_embed, (bs, 1, self.num_cams, self.embed_dims)
-            )
-            feature = ttnn.add(feat_exp, cam_exp)
+            # Materialise both operands at [1, 1, N*nc, C] instead of letting a broadcast
+            # do it from [N, 1, C] and [1, nc, C].
+            #
+            # The broadcast form is the obvious one and it is the expensive one: 1 and nc
+            # land in the tile axis, which pads to 32, so a 1.3 MB answer is computed
+            # through a 14 MB intermediate — 91% of the tiles carry nothing. Profiled, the
+            # reshape in, the add and the reshape out came to 3.93 ms/frame between them.
+            #
+            # repeat_interleave on the anchors and repeat on the cameras cost two extra ops
+            # but leave every axis tile-aligned, and the add itself then has no broadcast.
+            # Measured on the real shapes: 882 -> 515 us per call.
+            #
+            # The row order is load-bearing. repeat_interleave gives anchor-major and repeat
+            # cycles the cameras fastest, which is exactly the (anchor, camera) ordering the
+            # reshape after the linear relies on to read clp = cam*L*K + level*K + point.
+            feat_flat = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
+            cam_flat = ttnn.reshape(camera_embed, (1, 1, self.num_cams, self.embed_dims))
+            f_rep = ttnn.repeat_interleave(feat_flat, self.num_cams, dim=2)
+            c_rep = ttnn.repeat(cam_flat, ttnn.Shape([1, 1, bs * num_anchor, 1]))
+            feature = ttnn.add(f_rep, c_rep)
+            ttnn.deallocate(f_rep)
+            ttnn.deallocate(c_rep)
             # Don't deallocate camera_embed — it's cached for reuse
-            feature = ttnn.reshape(
-                feature, (1, 1, bs * num_anchor * self.num_cams, self.embed_dims)
-            )
         else:
             feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
 
@@ -1219,6 +1135,7 @@ class DeformableFeatureAggregation:
                 self._cached_proj_rm, self._cached_wh_rm,
                 num_cams=nc, num_pts=self.num_pts,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                use_tile_compute=_KPS_TILE,
             )
             ttnn.deallocate(key_points)
             ttnn.deallocate(anchor_rm)

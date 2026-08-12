@@ -25,3 +25,7 @@ debug/
 logs/
 *.swp
 *.swo
+
+# Generated media — inference videos are large binaries regenerated on demand
+outputs/
+*.mp4

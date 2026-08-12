@@ -1,0 +1,39 @@
+%% One DFA decoder layer, per device, as the profiler recorded it.
+%% Blue = ROW_MAJOR, orange = TILE, red = a layout conversion.
+%% Times are ms/frame across all 6 layers (device kernel time, frame 0 excluded).
+flowchart TD
+    subgraph RM["ROW_MAJOR island — sampling"]
+        direction TB
+        KPS["KpsProjectFused<br/>17.4 ms"]
+        GC["GridCompact<br/>0.14 ms"]
+        GS["GridSample x4 levels<br/>10.2 ms"]
+        TS["TransposedS2i x4<br/>0.99 ms"]
+    end
+
+    subgraph TL["TILE island — decoder"]
+        direction TB
+        RS["ReduceScatter + AllGather<br/>0.80 ms"]
+        MM["Matmul x293<br/>9.3 ms"]
+        LN["LayerNorm x154<br/>1.8 ms"]
+        BN["BinaryNg x124<br/>6.0 ms"]
+        SC["Slice / Concat / Reshape<br/>9.7 ms"]
+    end
+
+    WT["weights_fc linear<br/>(already TILE)"]
+
+    KPS --> GC --> GS --> TS
+    TS -.->|"ROW_MAJOR"| GWS
+    WT -->|"TilizeWithValPadding<br/>ROW to TILE, 1.54 ms"| GWS
+
+    GWS["GroupedWeightedSum<br/>ROW to TILE boundary<br/>6.0 ms"]
+
+    GWS --> RS --> MM --> LN --> BN --> SC
+    SC -.->|"next layer"| KPS
+
+    classDef rowmajor fill:#1565C0,stroke:#0D47A1,color:#fff
+    classDef tile fill:#E65100,stroke:#BF360C,color:#fff
+    classDef convert fill:#B71C1C,stroke:#7F0000,color:#fff,stroke-width:3px
+
+    class KPS,GC,GS,TS rowmajor
+    class RS,MM,LN,BN,SC,WT tile
+    class GWS convert

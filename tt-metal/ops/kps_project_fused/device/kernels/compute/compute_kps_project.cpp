@@ -10,7 +10,10 @@
 //   For each camera:
 //     3. add_tiles: translated + ones_col3 → pts_homo [32,32]                    (f32)
 //     4. matmul_tiles: pts_homo [32,32] × proj_T [32,32] → projected [32,32]     (f32)
-//     5. Push projected tile to output CB (writer does perspective divide + normalize)
+//        with proj_T arranged so col0 = pz and col1/2 = the normalise and Q14 scale
+//        already folded in (see the reader)
+//     5. recip_tile + mul_tiles_bcast_cols: the perspective divide, on the SFPU
+//     6. Push to output CB; the writer only subtracts the -1 offset and casts to int16
 // =============================================================================
 
 #include <cstdint>
@@ -20,6 +23,10 @@
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/pack.h"
 #include "api/compute/reg_api.h"
+#include "api/compute/bcast.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/recip.h"
+#include "api/compute/binary_max_min.h"
 
 void kernel_main() {
     uint32_t num_anchors = get_arg_val<uint32_t>(0);
@@ -34,9 +41,13 @@ void kernel_main() {
     constexpr auto cb_rotated  = tt::CBIndex::c_5;   // intermediate: rotated bf16
     constexpr auto cb_trans    = tt::CBIndex::c_6;    // intermediate: translated bf16
     constexpr auto cb_homo     = tt::CBIndex::c_7;    // intermediate: homogeneous f32
-    constexpr auto cb_out      = tt::CBIndex::c_16;   // projected output f32
+    constexpr auto cb_proj_raw = tt::CBIndex::c_8;    // pre-divide: col0 = pz, col1/2 = scaled x/y
+    constexpr auto cb_invz     = tt::CBIndex::c_9;    // reciprocal, col0 = 1/pz
+    constexpr auto cb_zfloor   = tt::CBIndex::c_10;   // constant: 1e-5 in col0, -FLT_MAX elsewhere
+    constexpr auto cb_out      = tt::CBIndex::c_16;   // grid coords, Q14 before the -1
 
     constexpr uint32_t dst0 = 0;
+    constexpr uint32_t dst1 = 1;
 
     for (uint32_t a = 0; a < num_anchors; a++) {
         // ---- Step 1: Rotation via matmul ----
@@ -111,13 +122,60 @@ void kernel_main() {
             tile_regs_commit();
 
             tile_regs_wait();
-            cb_reserve_back(cb_out, 1);
-            pack_tile(dst0, cb_out);  // f32 projected result
+            cb_reserve_back(cb_proj_raw, 1);
+            pack_tile(dst0, cb_proj_raw);  // col0 = pz, col1 = sx*px, col2 = sy*py
             tile_regs_release();
-            cb_push_back(cb_out, 1);
+            cb_push_back(cb_proj_raw, 1);
 
             cb_pop_front(cb_homo, 1);
             cb_pop_front(cb_proj, 1);
+
+            // ---- Step 5: perspective divide, on the SFPU ----
+            // This is the work the writer used to do per point in soft float on a core
+            // with no FPU, and it measured 73% of this path. Two tile ops replace it.
+            //
+            // reciprocal of the whole tile: only column 0 is meaningful (1/pz), the rest
+            // is the reciprocal of numerators nobody reads.
+            cb_wait_front(cb_proj_raw, 1);
+            cb_wait_front(cb_zfloor, 1);
+            tile_regs_acquire();
+            copy_tile_to_dst_init_short(cb_proj_raw);
+            copy_tile(cb_proj_raw, 0, dst0);
+            copy_tile_to_dst_init_short(cb_zfloor);
+            copy_tile(cb_zfloor, 0, dst1);
+            // Floor the depth before inverting it. A point behind the camera has pz <= 0,
+            // and 1/pz would then be negative — px/pz comes back sign-flipped at a
+            // plausible magnitude, which reads as a valid in-bounds sample of the wrong
+            // pixel rather than an out-of-bounds one. Flooring turns it into a huge
+            // coordinate that clamps out, which is what the scalar writer's z_safe did.
+            binary_max_tile_init();
+            binary_max_tile(dst0, dst1, dst0);
+            recip_tile_init();
+            recip_tile(dst0);
+            tile_regs_commit();
+            tile_regs_wait();
+            cb_reserve_back(cb_invz, 1);
+            pack_tile(dst0, cb_invz);
+            tile_regs_release();
+            cb_push_back(cb_invz, 1);
+
+            // Broadcast column 0 across the row and multiply: columns 1 and 2 become
+            // sx*px/pz and sy*py/pz, i.e. the Q14 grid coordinate before the -1 offset.
+            // Column 0 is the only one the COL broadcast can take, which is why the reader
+            // puts depth there.
+            cb_wait_front(cb_invz, 1);
+            tile_regs_acquire();
+            mul_bcast_cols_init_short(cb_proj_raw, cb_invz);
+            mul_tiles_bcast_cols(cb_proj_raw, cb_invz, 0, 0, dst0);
+            tile_regs_commit();
+            tile_regs_wait();
+            cb_reserve_back(cb_out, 1);
+            pack_tile(dst0, cb_out);
+            tile_regs_release();
+            cb_push_back(cb_out, 1);
+
+            cb_pop_front(cb_proj_raw, 1);
+            cb_pop_front(cb_invz, 1);
         }
 
         // Pop shared resources after all cameras done
