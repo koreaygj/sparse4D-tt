@@ -106,6 +106,14 @@ else:
 # TT_KPS_TILE=0 restores the fp32 path when localisation accuracy matters more than latency.
 _KPS_TILE = _os.environ.get("TT_KPS_TILE", "1") == "1"
 
+# Feed grid_sample the precomputed 6-field grid built on-device by ttnn.grid_precompute
+# instead of Q14 coordinates the reader decodes in soft float. The reader's coordinate
+# math measured ~62% of grid_sample; feeding it the precomputed form took the frame
+# 75.63 -> 71.66 ms. Full val, 6019 samples: mAP 0.44802 -> 0.44877, NDS 0.5520 ->
+# 0.5523, DFA output PCC identical at 0.999830 — on by default on that evidence.
+# TT_GRID_PRECOMP=0 restores the in-reader coordinate math.
+_GRID_PRECOMP = _os.environ.get("TT_GRID_PRECOMP", "1") == "1"
+
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -259,6 +267,18 @@ class DeformableFeatureAggregation:
         self._grid_precomputed_sharded_mem = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec_precomputed
         )
+        # Same width, but at the COMPACTED row count — the precomputed grids are produced
+        # from cgrid, so their shard height must line up with the bidx shard the way the
+        # Q14 grid's does.
+        self._cgrid_precomp_sharded_mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                _core_grid, (_cshard_h, _padded_precomputed), ttnn.ShardOrientation.ROW_MAJOR
+            ),
+        )
+        self._gp_consts = None
+        self._gp_out = None
 
         # Pre-allocate scalar constants on device (reused per camera in _project_points)
         _skw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
@@ -981,6 +1001,76 @@ class DeformableFeatureAggregation:
         ttnn.deallocate(weights)
         return out
 
+    def _run_grid_precompute(self, spatial_shapes):
+        """Turn the compacted Q14 grid into per-level precomputed grids, on device.
+
+        The constant pack (per-level affine/bound tiles plus the selector matrices that
+        route factors into the FIELD-MAJOR output columns) is built once here and reused —
+        building it in the kernel was priced at ~0.6 ms/frame, a DMA of the same tiles is
+        microseconds. The ordering and the field-major column map are contracts shared
+        with the op's reader kernel and with grid_sample's precomputed decode; the
+        authoritative copy of both lives in those kernels' comments.
+        """
+        K = self.num_pts
+        if self._gp_consts is None:
+            NL = len(spatial_shapes)
+            OT = (K * 6 + 31) // 32
+            tiles = []
+            for h, w in spatial_shapes:            # SCALE_l
+                t = torch.zeros(32, 32)
+                for pt in range(K):
+                    t[:, 2 * pt] = w / 32768.0
+                    t[:, 2 * pt + 1] = h / 32768.0
+                tiles.append(t)
+            for h, w in spatial_shapes:            # BIAS_l
+                t = torch.zeros(32, 32)
+                for pt in range(K):
+                    t[:, 2 * pt] = w / 2.0 - 0.5
+                    t[:, 2 * pt + 1] = h / 2.0 - 0.5
+                tiles.append(t)
+            for h, w in spatial_shapes:            # C_l
+                t = torch.zeros(32, 32)
+                for pt in range(K):
+                    t[:, 2 * pt] = w - 1
+                    t[:, 2 * pt + 1] = h - 1
+                tiles.append(t)
+            sel = [torch.zeros(32, 32) for _ in range(5 * OT)]
+            for pt in range(K):
+                for f, kind, src in (
+                    (2, 0, 2 * pt), (4, 0, 2 * pt),          # SB0: b0 -> nw, sw
+                    (3, 1, 2 * pt), (5, 1, 2 * pt),          # SB1: b1 -> ne, se
+                    (2, 2, 2 * pt + 1), (3, 2, 2 * pt + 1),  # SH0: a0 -> nw, ne
+                    (4, 3, 2 * pt + 1), (5, 3, 2 * pt + 1),  # SH1: a1 -> sw, se
+                    (0, 4, 2 * pt + 1), (1, 4, 2 * pt),      # SI: h0 <- y, w0 <- x
+                ):
+                    g = f * K + pt                           # field-major column
+                    sel[5 * (g // 32) + kind][src, g % 32] = 1.0
+            tiles += sel
+            _kw = dict(device=self.device)
+            if self._mesh_device is not None:
+                _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            self._gp_consts = ttnn.from_torch(
+                torch.stack(tiles).reshape(1, 1, -1, 32),
+                dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, **_kw,
+            )
+            self._gp_out = [
+                ttnn.from_torch(
+                    torch.zeros(1, self._oob_cap, 1, K * 6),
+                    dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG, **_kw,
+                )
+                for _ in range(NL)
+            ]
+
+        ttnn.grid_precompute(
+            self._cgrid, self._gp_consts,
+            self._gp_out[0], self._gp_out[1], self._gp_out[2], self._gp_out[3],
+            num_pts=K,
+        )
+        return [
+            ttnn.to_memory_config(o, self._cgrid_precomp_sharded_mem) for o in self._gp_out
+        ]
+
     def _compact_grid(self, points_2d, n, nc, spatial_shapes):
         """Compact the sampling grid to the rows that actually hit an image.
 
@@ -1155,8 +1245,12 @@ class DeformableFeatureAggregation:
                 points_2d_sh, bidx_sh = self._compact_grid(
                     points_2d, n, nc, spatial_shapes
                 )
+                gp_grids = (
+                    self._run_grid_precompute(spatial_shapes) if _GRID_PRECOMP else None
+                )
             else:
                 points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
+                gp_grids = None
             ttnn.deallocate(points_2d)
 
             if _WT_COMPACT and self.use_camera_embed:
@@ -1172,10 +1266,20 @@ class DeformableFeatureAggregation:
                     weights_t = self._mask_weights(weights_t, n, nc)
 
             for level_idx, fm_tt in enumerate(feature_maps):
-                sampled = ttnn.grid_sample(
-                    fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False,
-                    batch_index=bidx_sh,
-                )
+                if gp_grids is not None:
+                    # Per-level precomputed grid: pixel indices and masked bilinear
+                    # weights already computed on the Tensix engines, so the reader
+                    # skips its ~928-cycle soft-float coordinate math per point.
+                    sampled = ttnn.grid_sample(
+                        fm_tt, gp_grids[level_idx], padding_mode="zeros",
+                        align_corners=False, use_precomputed_grid=True,
+                        batch_index=bidx_sh,
+                    )
+                else:
+                    sampled = ttnn.grid_sample(
+                        fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False,
+                        batch_index=bidx_sh,
+                    )
                 ttnn.transposed_s2i(
                     sampled, self._rearrange_buf,
                     num_cams=nc, num_pts=self.num_pts, num_anchors=n,
@@ -1184,6 +1288,9 @@ class DeformableFeatureAggregation:
                     capacity=self._oob_cap if _OOB_COMPACT else 0,
                 )
             ttnn.deallocate(points_2d_sh)
+            if gp_grids is not None:
+                for g in gp_grids:
+                    ttnn.deallocate(g)
             if bidx_sh is not None:
                 ttnn.deallocate(bidx_sh)
 
