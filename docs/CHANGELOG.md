@@ -9,8 +9,8 @@ Headline results live in the [README](../README.md); this file records how they 
 
 ## v3
 
-Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4480**, NDS 0.5186 ->
-**0.5520**. Latency 90.7 -> **77.7 ms/sample** (11.02 -> 12.86 FPS).
+Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4488**, NDS 0.5186 ->
+**0.5523**. Latency 90.7 -> **71.7 ms/sample** (11.02 -> 13.96 FPS).
 
 ### Accuracy
 
@@ -103,6 +103,29 @@ Two things were deliberately left alone, both for numerical reasons:
 Accuracy across the two stages: mAP 0.44756 -> 0.44733 -> **0.44802**, i.e. unchanged. The
 cost is localisation only — **mATE 0.5532 -> 0.5620** — because the projection is now bf16
 tile matmuls rather than software fp32. `TT_KPS_TILE=0` restores the fp32 path.
+
+**`fe6c89a` — materialise the camera-embed add instead of broadcasting it**
+
+- The broadcast form put 1 and 3 in the tile axis, which pads to 32: a 1.3 MB result
+  computed through a 14 MB intermediate, 91% padding. reshape + add + reshape = 3.93
+  ms/frame
+- repeat_interleave + repeat + plain add: every axis tile-aligned, 882 -> 515 us/call
+- Full val bit-identical (same pairs summed in the same order); 77.7 -> 75.4 ms
+
+**`5cbe641` / `2c9f9f9` — grid_precompute: grid_sample's coordinate math on Tensix**
+
+- The sampler's reader derived pixel indices and bilinear weights per point in soft float
+  on an FPU-less core — 62% of the op. A new op computes the 6-field precomputed form
+  after compaction (SFPU for all values, FPU only for 0/1 selector routing) and
+  grid_sample consumes it with `use_precomputed_grid=True`
+- The op itself took four measured rounds to get cheap (948 -> 518 us/call): resident
+  constants (68 DMA barriers -> 1), hardware format conversion (packer/SFPU instead of
+  soft-float casts, was 682 us), removing a `c % 6` these dividerless cores turned into a
+  library call, and FIELD-MAJOR output rows so the writer copies contiguous runs
+- Full val: mAP 0.44802 -> **0.44877**, DFA PCC identical at 0.999830 either way.
+  Latency 75.63 -> **71.66 ms** (13.96 FPS). `TT_GRID_PRECOMP=0` restores the reader math
+- What remains in the op is mostly per-call fixed cost: kernel 251 us vs FW+dispatch 267
+  us, so further kernel work is capped at ~0.6 ms/frame and was left on the table
 
 ### Rejected by measurement
 

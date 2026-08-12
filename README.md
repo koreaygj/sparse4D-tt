@@ -20,8 +20,8 @@ Sparse4D v3 3D object detection, ported to Tenstorrent (Wormhole/Blackhole).
 
 |  | PyTorch | TT-NN Pure (N300) | ~~v1~~ | ~~v2~~ | **Custom Kernels v3 (N300)** |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Latency / sample** | ~95 ms | 235 ms | ~~122 ms~~ | ~~95.2 ms~~ | **77.7 ms** |
-| **FPS** | 10.5 | 4.2 | ~~8.2~~ | ~~10.51~~ | **12.86** |
+| **Latency / sample** | ~95 ms | 235 ms | ~~122 ms~~ | ~~95.2 ms~~ | **71.7 ms** |
+| **FPS** | 10.5 | 4.2 | ~~8.2~~ | ~~10.51~~ | **13.96** |
 
 - Metric: `model.forward` on one 6-camera sample
 - v3: median over a full 6019-sample val run — mean 78.1, p90 78.6, max 349.4
@@ -45,23 +45,24 @@ Full nuScenes val, 6019 samples.
 
 |  | PyTorch (CUDA) | ~~TT-NN v2~~ | **TT-NN v3 (N300)** | Gap (v3) |
 | :--- | :---: | :---: | :---: | :---: |
-| **mAP** | 0.4529 | ~~0.3974~~ | **0.4480** | -0.0049 |
-| **NDS** | 0.5602 | ~~0.5190~~ | **0.5520** | -0.0082 |
-| **mATE** | 0.5455 | ~~0.6173~~ | **0.5620** | +0.0165 |
-| **mASE** | 0.2622 | ~~0.2693~~ | **0.2631** | +0.0009 |
-| **mAOE** | 0.4373 | ~~0.4730~~ | **0.4691** | +0.0318 |
-| **mAVE** | 0.2195 | ~~0.2624~~ | **0.2176** | -0.0019 |
-| **mAAE** | 0.1987 | ~~0.1747~~ | **0.2080** | +0.0093 |
+| **mAP** | 0.4529 | ~~0.3974~~ | **0.4488** | -0.0041 |
+| **NDS** | 0.5602 | ~~0.5190~~ | **0.5523** | -0.0079 |
+| **mATE** | 0.5455 | ~~0.6173~~ | **0.5571** | +0.0116 |
+| **mASE** | 0.2622 | ~~0.2693~~ | **0.2610** | -0.0012 |
+| **mAOE** | 0.4373 | ~~0.4730~~ | **0.4787** | +0.0414 |
+| **mAVE** | 0.2195 | ~~0.2624~~ | **0.2146** | -0.0049 |
+| **mAAE** | 0.1987 | ~~0.1747~~ | **0.2094** | +0.0107 |
 
 Comparability:
 
 - Controlled pair either side of the softmax fix — **0.4019 -> 0.4476 mAP**, same
   checkpoint (`sparse4dv3_r50.pth`), same tree, one changed function. That fix is where
   essentially all of the accuracy came from
-- The remaining 0.4476 -> 0.4480 is the tile/SFPU projection path, measured across two more
-  full vals and inside noise either way. What it does move is **mATE, 0.5532 -> 0.5620** —
-  the projection runs as bf16 tile matmuls rather than software fp32, and localisation is
-  the only metric that touches. `TT_KPS_TILE=0` buys that back for 12 ms a frame
+- The remaining 0.4476 -> 0.4488 spans three speed changes (tile/SFPU projection,
+  camera-embed materialise, grid_precompute), each inside noise on mAP across its own
+  full val. The projection path costs ~0.006 of mATE (bf16 tile matmuls instead of
+  software fp32; `TT_KPS_TILE=0` restores it), and grid_precompute is PCC-identical
+  (0.999830 flag on or off)
 - v2 column: several changes older, checkpoint not recorded — history
 - PyTorch column: carried from earlier in this file, not re-run here
 
