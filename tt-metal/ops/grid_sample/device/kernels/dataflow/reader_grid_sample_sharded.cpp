@@ -181,7 +181,7 @@ void kernel_main() {
                 last_chunk_partial,
                 input_cb_index,
                 scalar_cb_index>(
-                noc, input_cb, scalar_cb, grid_stick_ptr, in_grid_row_idx, input_tensor_accessor, batch_offset);
+                noc, input_cb, scalar_cb, grid_stick_ptr, in_grid_row_idx, grid_batching_factor, input_tensor_accessor, batch_offset);
         } else {
             // Padding stick from height-sharding — push zero-weight data to CBs
             // so the compute kernel receives the expected number of items.

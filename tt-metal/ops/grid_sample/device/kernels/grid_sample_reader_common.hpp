@@ -49,6 +49,7 @@ struct GridCoordinateReader {
     ALWI static void read_grid_point(
         GridPtrType grid_ptr,
         uint32_t grid_idx,
+        uint32_t grid_k,
         float height_scale,
         float height_offset,
         float width_scale,
@@ -64,21 +65,28 @@ struct GridCoordinateReader {
         uint16_t& weight_sw_bf,
         uint16_t& weight_se_bf) {
         if constexpr (use_precomputed_grid) {
-            // Each precomputed grid entry has 6 values: h0, w0, weight_nw, weight_ne, weight_sw, weight_se
-            const uint32_t precomputed_data_offset = grid_idx * PRECOMPUTED_GRID_ELEMENTS_PER_POINT;
-            const int16_t h0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[precomputed_data_offset + 0]);
-            const int16_t w0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[precomputed_data_offset + 1]);
+            // FIELD-MAJOR within the stick: [h0 x K][w0 x K][nw x K][ne x K][sw x K][se x K],
+            // K being the grid batching factor. Grouping by field rather than by point lets
+            // the producer (grid_precompute's writer) emit each field as one contiguous run
+            // instead of interleaving two source tiles two bytes at a time — the interleaved
+            // form cost that writer ~40 instructions per value. This reader does the same
+            // six loads either way; only the offsets differ.
+            //
+            // NOTE this diverges from upstream's interleaved layout, and from what the host
+            // prepare_grid_sample_grid emits. In this repo the only producer of precomputed
+            // grids is ttnn.grid_precompute, which emits this layout.
+            const int16_t h0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[grid_idx]);
+            const int16_t w0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[grid_k + grid_idx]);
 
             h0 = static_cast<int32_t>(h0_raw);
             w0 = static_cast<int32_t>(w0_raw);
             h1 = h0 + 1;
             w1 = w0 + 1;
 
-            // Read precomputed weights
-            weight_nw_bf = grid_ptr[precomputed_data_offset + 2];
-            weight_ne_bf = grid_ptr[precomputed_data_offset + 3];
-            weight_sw_bf = grid_ptr[precomputed_data_offset + 4];
-            weight_se_bf = grid_ptr[precomputed_data_offset + 5];
+            weight_nw_bf = grid_ptr[2 * grid_k + grid_idx];
+            weight_ne_bf = grid_ptr[3 * grid_k + grid_idx];
+            weight_sw_bf = grid_ptr[4 * grid_k + grid_idx];
+            weight_se_bf = grid_ptr[5 * grid_k + grid_idx];
         } else {
             // Each regular grid entry has 2 values: x, y coordinates
             float h_coord_rel, w_coord_rel;
@@ -315,6 +323,7 @@ ALWI void process_grid_point(
     experimental::CB scalar_cb,
     GridPtrType grid_ptr,
     uint32_t grid_idx,
+    uint32_t grid_k,
     const TensorAccessor& input_tensor_accessor,
     uint32_t batch_offset) {
     // PyTorch grid_sample coordinate convention:
@@ -342,6 +351,7 @@ ALWI void process_grid_point(
     GridCoordinateReader<grid_dtype, use_precomputed_grid>::template read_grid_point(
         grid_ptr,
         grid_idx,
+        grid_k,
         height_scale,
         height_offset,
         width_scale,
