@@ -10,7 +10,7 @@ Headline results live in the [README](../README.md); this file records how they 
 ## v3
 
 Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4488**, NDS 0.5186 ->
-**0.5523**. Latency 90.7 -> **71.7 ms/sample** (11.02 -> 13.96 FPS).
+**0.5523**. Latency 90.7 -> **68.6 ms/sample** (11.02 -> 14.59 FPS).
 
 ### Accuracy
 
@@ -51,6 +51,32 @@ Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4488**, NDS 0.51
 **`d5b833a` — grid_sample padding clamp used the input batch, not the grid's**
 
 ### Speed
+
+**`a5728ad` — row-major FPN 3x3 conv IO to skip conv2d's internal reshapes**
+
+- The FPN 3x3 convs fall into conv2d's DRAM-slice mode, which reshapes its input
+  flat -> NHWC and its output NHWC -> flat internally. On TILE tensors both moves are
+  real (885 + 868 us at level 0 alone); on ROW_MAJOR with the channel dim unchanged
+  they are free views
+- Two lines: untilize the conv input, `output_layout=ROW_MAJOR` on the conv. The RM
+  output also suits the consumer — DFA reads these maps as RM NHWC for grid_sample
+- ReshapeView 5.34 -> 3.38 ms/frame, no tilize/untilize growth. Device kernel total
+  68.63 -> 66.61 ms/frame, wall median 71.7 -> 69.7 ms. Full val bit-identical
+  (mAP 0.4487746)
+
+**`e39a78c` — block-diagonal weights_fc emits folded attention rows directly**
+
+- The camera-embed linear produced `[N*cams, 416]` with the camera in the row axis;
+  folding it to the `[N, cams*416]` row the softmax needs was a TILE reshape moving
+  every element, 139 us x 6 layers = 0.81 ms/frame
+- Instead the operands are built wide — rows `[f|f|f] + [c0|c1|c2]` — against a
+  block-diagonal copy of the weight, so the linear emits the folded row itself.
+  Same bytes materialised, and 3x the MACs priced at zero: the matmul measured
+  75.7 -> 71.4 us/call because setup, not FLOPs, dominates at this size
+- Net -0.68 ms/frame (tilize of the wider rows gives back 0.48 of the 1.16 saved).
+  Device kernel total 66.61 -> 65.93 ms/frame, wall median 68.6 ms (14.59 FPS over
+  4250 samples). Full val bit-identical — off-diagonal zeros add exact 0.0 into the
+  fp32 accumulator
 
 **`93f3f3f` — parallelise `grid_compact`, store the grid as Q14 fixed point**
 

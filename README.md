@@ -20,11 +20,11 @@ Sparse4D v3 3D object detection, ported to Tenstorrent (Wormhole/Blackhole).
 
 |  | PyTorch | TT-NN Pure (N300) | ~~v1~~ | ~~v2~~ | **Custom Kernels v3 (N300)** |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Latency / sample** | ~95 ms | 235 ms | ~~122 ms~~ | ~~95.2 ms~~ | **71.7 ms** |
-| **FPS** | 10.5 | 4.2 | ~~8.2~~ | ~~10.51~~ | **13.96** |
+| **Latency / sample** | ~95 ms | 235 ms | ~~122 ms~~ | ~~95.2 ms~~ | **68.6 ms** |
+| **FPS** | 10.5 | 4.2 | ~~8.2~~ | ~~10.51~~ | **14.59** |
 
 - Metric: `model.forward` on one 6-camera sample
-- v3: median over a full 6019-sample val run — mean 78.1, p90 78.6, max 349.4
+- v3: median over a 6019-sample val run — mean 69.0 (steady-state, 4250-sample window)
 - Scene choice matters: anchors surviving the OOB compaction vary by scene, and one scene
   replayed reads 99.9 ms against 90.7 ms across scenes on the same build, so a short bench
   on one scene is not the number
