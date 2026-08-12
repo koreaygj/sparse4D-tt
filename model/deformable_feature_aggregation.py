@@ -324,6 +324,21 @@ class DeformableFeatureAggregation:
             parameters["weights_fc_bias"]
         )  # [1,1,1,416]
 
+        if use_camera_embed:
+            # Block-diagonal copy of weights_fc: linear([f|f|f] + [c0|c1|c2]) then
+            # emits the folded [N, cams*416] row directly, replacing the TILE reshape
+            # [N*cams, 416] -> [N, cams*416] after the linear. The off-diagonal zeros
+            # add exact 0.0 into the fp32 accumulator, so the outputs are unchanged.
+            w = parameters["weights_fc_weight"].t()  # [256, 416]
+            d_in, d_out = w.shape
+            wbd = torch.zeros(num_cams * d_in, num_cams * d_out, dtype=w.dtype)
+            for c in range(num_cams):
+                wbd[c * d_in : (c + 1) * d_in, c * d_out : (c + 1) * d_out] = w
+            self.weights_fc_weight_bd = self._to_device(wbd)  # [768, 1248]
+            self.weights_fc_bias_bd = self._to_device_bias(
+                parameters["weights_fc_bias"].repeat(num_cams)
+            )  # [1,1,1,1248]
+
         # Output projection
         self.output_proj_weight = self._to_device(
             parameters["output_proj_weight"].t()
@@ -804,57 +819,51 @@ class DeformableFeatureAggregation:
                 or self._cached_camera_embed is None
             ):
                 self._cached_camera_embed = self._camera_encoder(projection_mat, bs)
-            camera_embed = self._cached_camera_embed
-            # Materialise both operands at [1, 1, N*nc, C] instead of letting a broadcast
-            # do it from [N, 1, C] and [1, nc, C].
-            #
-            # The broadcast form is the obvious one and it is the expensive one: 1 and nc
-            # land in the tile axis, which pads to 32, so a 1.3 MB answer is computed
-            # through a 14 MB intermediate — 91% of the tiles carry nothing. Profiled, the
-            # reshape in, the add and the reshape out came to 3.93 ms/frame between them.
-            #
-            # repeat_interleave on the anchors and repeat on the cameras cost two extra ops
-            # but leave every axis tile-aligned, and the add itself then has no broadcast.
-            # Measured on the real shapes: 882 -> 515 us per call.
-            #
-            # The row order is load-bearing. repeat_interleave gives anchor-major and repeat
-            # cycles the cameras fastest, which is exactly the (anchor, camera) ordering the
-            # reshape after the linear relies on to read clp = cam*L*K + level*K + point.
+                # Row form [1,1,1,nc*C] for the block-diagonal linear below; tiny
+                # TILE reshape, paid once per frame alongside the encoder.
+                self._cached_camera_row = ttnn.reshape(
+                    self._cached_camera_embed,
+                    (1, 1, 1, self.num_cams * self.embed_dims),
+                )
+            # Build the operands wide instead of tall: [N, nc*C] rows [f|f|f] and
+            # [c0|c1|c2]. Same bytes as the old [N*nc, C] materialisation (the
+            # broadcast form was rejected earlier — 1 and nc land in the tile axis
+            # and pad to 32, computing a 1.3 MB answer through a 14 MB
+            # intermediate), but with the camera in the COLUMNS the linear against
+            # the block-diagonal weights_fc emits the folded [N, cams*L*K*G] row
+            # directly and the TILE reshape that followed the linear disappears.
             feat_flat = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
-            cam_flat = ttnn.reshape(camera_embed, (1, 1, self.num_cams, self.embed_dims))
-            f_rep = ttnn.repeat_interleave(feat_flat, self.num_cams, dim=2)
-            c_rep = ttnn.repeat(cam_flat, ttnn.Shape([1, 1, bs * num_anchor, 1]))
+            f_rep = ttnn.repeat(feat_flat, ttnn.Shape([1, 1, 1, self.num_cams]))
+            c_rep = ttnn.repeat(
+                self._cached_camera_row, ttnn.Shape([1, 1, bs * num_anchor, 1])
+            )
             feature = ttnn.add(f_rep, c_rep)
             ttnn.deallocate(f_rep)
             ttnn.deallocate(c_rep)
             # Don't deallocate camera_embed — it's cached for reuse
+
+            # Column index is cam*(L*K*G) + (level*K + point)*G + g: the camera
+            # block comes from the weight's block column, the rest from the
+            # linear's own column order — the clp*G + g ordering the feature
+            # buffer and the mask already use.
+            weights = ttnn.linear(
+                feature,
+                self.weights_fc_weight_bd,
+                bias=self.weights_fc_bias_bd,
+                compute_kernel_config=self._hifi_compute_config,
+            )
+            ttnn.deallocate(feature)
         else:
             feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
-
-        weights = ttnn.linear(
-            feature,
-            self.weights_fc_weight,
-            bias=self.weights_fc_bias,
-            compute_kernel_config=self._hifi_compute_config,
-        )
-
-        ttnn.deallocate(feature)
+            weights = ttnn.linear(
+                feature,
+                self.weights_fc_weight,
+                bias=self.weights_fc_bias,
+                compute_kernel_config=self._hifi_compute_config,
+            )
+            ttnn.deallocate(feature)
 
         total_clp = self.num_cams * self.num_levels * self.num_pts
-        if self.use_camera_embed:
-            # [1, 1, bs*N, CLP*G]. The camera came from the row axis and the linear's
-            # columns are (level, point, group), so the merged column index is exactly
-            # clp*G + g with clp = cam*L*K + level*K + point — the ordering the feature
-            # buffer and the mask both already use.
-            weights = ttnn.reshape(
-                weights,
-                (
-                    1,
-                    1,
-                    bs * num_anchor,
-                    self.num_cams * self.num_levels * self.num_pts * self.num_groups,
-                ),
-            )
 
         # Only the camera-embed path produces the compact layout for free: without it the
         # linear has no camera axis to fold into the columns, so CLP*G would not be the
