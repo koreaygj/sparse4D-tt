@@ -28,6 +28,7 @@ cp -r tt-metal/ops/grouped_weighted_sum ~/tt-metal/ttnn/cpp/ttnn/operations/pool
 cp -r tt-metal/ops/transposed_s2i ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/grid_compact ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/grid_precompute ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
+cp -r tt-metal/ops/topk_select ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 ```
 
 `grid_sample` is an **upstream** op, patched rather than added — it gains an optional
@@ -50,6 +51,7 @@ Add to `file(GLOB_RECURSE kernels ...)`:
     transposed_s2i/device/kernels/*
     grid_compact/device/kernels/*
     grid_precompute/device/kernels/*
+    topk_select/device/kernels/*
 ```
 
 Add to `target_sources(ttnn_op_pool PRIVATE ...)`:
@@ -69,6 +71,9 @@ Add to `target_sources(ttnn_op_pool PRIVATE ...)`:
     grid_precompute/grid_precompute.cpp
     grid_precompute/device/grid_precompute_device_operation.cpp
     grid_precompute/device/grid_precompute_program_factory.cpp
+    topk_select/topk_select.cpp
+    topk_select/device/topk_select_device_operation.cpp
+    topk_select/device/topk_select_program_factory.cpp
 ```
 
 ### 2.3 Register nanobind
@@ -82,6 +87,7 @@ Add to the nanobind source list (near other `pool/` entries):
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/transposed_s2i/transposed_s2i_nanobind.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/grid_compact/grid_compact_nanobind.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/grid_precompute/grid_precompute_nanobind.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/topk_select/topk_select_nanobind.cpp
 ```
 
 ### 2.4 Register Python bindings
@@ -95,6 +101,7 @@ Add includes (near other `pool/` includes):
 #include "ttnn/operations/pool/transposed_s2i/transposed_s2i_nanobind.hpp"
 #include "ttnn/operations/pool/grid_compact/grid_compact_nanobind.hpp"
 #include "ttnn/operations/pool/grid_precompute/grid_precompute_nanobind.hpp"
+#include "ttnn/operations/pool/topk_select/topk_select_nanobind.hpp"
 ```
 
 Add bind calls in the `m_pool` section (near `grid_sample::bind_grid_sample(m_pool)`):
@@ -104,6 +111,7 @@ Add bind calls in the `m_pool` section (near `grid_sample::bind_grid_sample(m_po
     transposed_s2i::bind_transposed_s2i(m_pool);
     grid_compact::bind_grid_compact(m_pool);
     grid_precompute::bind_grid_precompute(m_pool);
+    topk_select::bind_topk_select(m_pool);
 ```
 
 ### 2.5 Build & Install

@@ -52,6 +52,23 @@ Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4488**, NDS 0.51
 
 ### Speed
 
+**topk_select: radix-sort top-k for the instance bank** (branch perf/topk-kernel)
+
+- ttnn.topk tile-pads the [1, 900] confidence row to 32 x 928 and bitonic-sorts
+  all 32 rows on ONE core — 97% of its work is tile padding. The two calls
+  (top-300 merge, top-600 cache) cost 1.89 + 2.76 ms/frame
+- New op reads only the real row (two 32 B face-row reads per tile, no untilize
+  op) and sorts with a 2-pass LSD radix over bf16 bits mapped to monotonic
+  uint16 keys — pure integer work, immune to the FPU-less-core soft-float trap.
+  Emits uint32 indices directly, absorbing the typecast that followed
+- 1893/2759 -> 161 us/call. Device kernel total 65.93 -> 61.94 ms/frame; wall
+  median 68.6 -> 67.2 ms (14.87 FPS) — the wall keeps ~2.6 ms less than the
+  device saving because the frame is now partly host-bound
+- Ordering: descending, ties to the LOWER index (torch semantics, verified
+  16/16 against a stable reference incl. 100-way ties). ttnn.topk leaves tie
+  order unspecified, so this is not bit-identical to the fallback on tied
+  confidences; full val gates the swap. TT_TOPK_KERNEL=0 restores ttnn.topk
+
 **`a5728ad` — row-major FPN 3x3 conv IO to skip conv2d's internal reshapes**
 
 - The FPN 3x3 convs fall into conv2d's DRAM-slice mode, which reshapes its input
