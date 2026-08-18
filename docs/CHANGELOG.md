@@ -9,8 +9,8 @@ Headline results live in the [README](../README.md); this file records how they 
 
 ## v3
 
-Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4488**, NDS 0.5186 ->
-**0.5523**. Latency 90.7 -> **68.6 ms/sample** (11.02 -> 14.59 FPS).
+Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4515**, NDS 0.5186 ->
+**0.5553**. Latency 90.7 -> **65.2 ms/sample** (11.02 -> 15.34 FPS).
 
 ### Accuracy
 
@@ -51,6 +51,32 @@ Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4488**, NDS 0.51
 **`d5b833a` — grid_sample padding clamp used the input batch, not the grid's**
 
 ### Speed
+
+**fold the temporal anchor projection into one affine matmul** (branch perf/topk-kernel)
+
+- The projection is linear in every anchor field, so the 13-op slice/matmul/concat
+  chain (plus 4 h2d uploads/frame) folds into anchor @ A + b with A built on host
+  from the frame's ego pose. Wall 67.2 -> 66.4 ms
+- Full val: mAP 0.4482 -> **0.4515**, NDS **0.5553**, mATE 0.5615 -> 0.5492, mAOE
+  0.4851 -> 0.4710 — the fold is MORE precise than the chain it replaced (one
+  fp32 matmul instead of repeated bf16 intermediate roundings), so the temporal
+  anchors improve and accuracy sets a new project best
+
+**make linear's relu a real fused epilogue** (branch perf/topk-kernel)
+
+- `ttnn.linear(activation="relu")` silently does NOT fuse without a user core
+  grid: matmul.cpp runs the activation as a separate unary op afterwards. The
+  encoder and refinement chains believed they were fused — the profile showed
+  168 stray RELU ops/frame (1.75 ms device + ~0.7 ms host dispatch)
+- Fix is `core_grid=ttnn.CoreGrid(y=8, x=8)` on those linears, which routes the
+  relu into the matmul program config. Bit-identical (relu commutes with bf16
+  rounding), verified PCC 1.0 on 5-sample raw outputs
+- Wall median 66.4 -> 65.2 ms (15.34 FPS); full val bit-identical to the fold build
+- Width-fusion survey alongside this: QKV and weights_fc were already fused;
+  the encoder (unequal 128/32/32/64 branches) and head chains are blocked by
+  per-branch LayerNorm — ttnn.group_norm as a segmented-LN substitute measured
+  10x worse than layer_norm (mean err 0.052 vs 0.0044, PCC 0.9983) and was
+  rejected
 
 **topk_select: radix-sort top-k for the instance bank** (branch perf/topk-kernel)
 
