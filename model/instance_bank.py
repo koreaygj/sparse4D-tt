@@ -38,6 +38,17 @@ _TOPK_KERNEL = (
     hasattr(ttnn, "topk_select") and _os.environ.get("TT_TOPK_KERNEL", "1") == "1"
 )
 
+# Paired row-gather kernel: one op replaces the two ttnn.gather calls (655
+# us/call on 4 cores, latency-bound) AND the index expansion chain each needed
+# (typecast/reshape/to_layout/repeat_interleave). Consumes topk_select's uint32
+# ROW_MAJOR indices directly, so it requires _TOPK_KERNEL. Bit-identical row
+# copies (verified exact incl. duplicate indices). TT_ROW_GATHER=0 falls back.
+_ROW_GATHER = (
+    _TOPK_KERNEL
+    and hasattr(ttnn, "row_gather")
+    and _os.environ.get("TT_ROW_GATHER", "1") == "1"
+)
+
 # Anchor box field indices
 X, Y, Z = 0, 1, 2
 W, L, H = 3, 4, 5
@@ -91,6 +102,8 @@ class InstanceBank:
         # Persistent output buffers for topk_select, one (values, indices) pair
         # per k. The op writes every slot on every call, so reuse is safe.
         self._topk_bufs = {}
+        # Persistent (features, anchors) output pair per k for row_gather.
+        self._rg_bufs = {}
 
         self.reset()
 
@@ -106,6 +119,20 @@ class InstanceBank:
                 torch.zeros(1, 1, 1, k, dtype=torch.int32), dtype=ttnn.uint32, **kw)
             buf = (vals, idxs)
             self._topk_bufs[k] = buf
+        return buf
+
+    def _rg_out(self, k: int):
+        buf = self._rg_bufs.get(k)
+        if buf is None:
+            kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device)
+            if self._mesh_device is not None:
+                kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            feat = ttnn.from_torch(
+                torch.zeros(1, k, self.embed_dims), dtype=ttnn.bfloat16, **kw)
+            anch = ttnn.from_torch(
+                torch.zeros(1, k, 11), dtype=_ANCHOR_DTYPE, **kw)
+            buf = (feat, anch)
+            self._rg_bufs[k] = buf
         return buf
 
     def _to_dev(self, tensor: torch.Tensor, dtype=None) -> ttnn.Tensor:
@@ -275,9 +302,12 @@ class InstanceBank:
             val_buf, idx_buf = self._topk_out(N)
             ttnn.topk_select(conf_max_2d, val_buf, idx_buf, N)
             ttnn.deallocate(conf_max_2d)
-            # Persistent buffer: reshape to a fresh view, never deallocated here.
-            top_idx = ttnn.reshape(idx_buf, (bs, N, 1))
-            top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+            if _ROW_GATHER:
+                top_idx = None   # row_gather eats idx_buf directly
+            else:
+                # Persistent buffer: reshape to a fresh view, never deallocated here.
+                top_idx = ttnn.reshape(idx_buf, (bs, N, 1))
+                top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
         else:
             _, top_idx_flat = ttnn.topk(conf_max_2d, N, dim=-1)
             ttnn.deallocate(conf_max_2d)
@@ -286,19 +316,25 @@ class InstanceBank:
             top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
             ttnn.deallocate(top_idx_flat)
 
-        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
-        selected_feature = ttnn.gather(instance_feature, 1, idx_feat)
-        ttnn.deallocate(idx_feat)
+        if _ROW_GATHER:
+            selected_feature, selected_anchor = self._rg_out(N)
+            ttnn.row_gather(instance_feature, idx_buf, selected_feature,
+                            src_b=anchor, out_b=selected_anchor, k=N)
+        else:
+            idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+            selected_feature = ttnn.gather(instance_feature, 1, idx_feat)
+            ttnn.deallocate(idx_feat)
 
-        anch_dim = anchor.shape[-1]
-        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
-        selected_anchor = ttnn.gather(anchor, 1, idx_anch)
-        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
+            anch_dim = anchor.shape[-1]
+            idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+            selected_anchor = ttnn.gather(anchor, 1, idx_anch)
+            ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
         # Device concat
         merged_feature = ttnn.concat([self.cached_feature, selected_feature], dim=1)
         merged_anchor = ttnn.concat([self.cached_anchor, selected_anchor], dim=1)
-        ttnn.deallocate(selected_feature); ttnn.deallocate(selected_anchor)
+        if not _ROW_GATHER:
+            ttnn.deallocate(selected_feature); ttnn.deallocate(selected_anchor)
 
         if self.mask.all():
             instance_feature = merged_feature
@@ -374,8 +410,11 @@ class InstanceBank:
             ttnn.deallocate(conf_scores)
             # Downstream (decay multiply next frame) works on TILE.
             top_conf = ttnn.to_layout(val_buf, ttnn.TILE_LAYOUT)
-            top_idx = ttnn.reshape(idx_buf, (bs, K, 1))
-            top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+            if _ROW_GATHER:
+                top_idx = None
+            else:
+                top_idx = ttnn.reshape(idx_buf, (bs, K, 1))
+                top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
         else:
             top_conf, top_idx_flat = ttnn.topk(conf_scores, K, dim=-1)
             ttnn.deallocate(conf_scores)
@@ -384,14 +423,21 @@ class InstanceBank:
             top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
             ttnn.deallocate(top_idx_flat)
 
-        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
-        self.cached_feature = ttnn.gather(instance_feature, 1, idx_feat)
-        ttnn.deallocate(idx_feat)
+        if _ROW_GATHER:
+            feat_buf, anch_buf = self._rg_out(K)
+            ttnn.row_gather(instance_feature, idx_buf, feat_buf,
+                            src_b=self._as_bank_dtype(anchor), out_b=anch_buf, k=K)
+            self.cached_feature = feat_buf
+            self.cached_anchor = anch_buf
+        else:
+            idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+            self.cached_feature = ttnn.gather(instance_feature, 1, idx_feat)
+            ttnn.deallocate(idx_feat)
 
-        anch_dim = anchor.shape[-1]
-        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
-        self.cached_anchor = ttnn.gather(self._as_bank_dtype(anchor), 1, idx_anch)
-        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
+            anch_dim = anchor.shape[-1]
+            idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+            self.cached_anchor = ttnn.gather(self._as_bank_dtype(anchor), 1, idx_anch)
+            ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
         self.confidence = ttnn.reshape(top_conf, (1, 1, bs, K))
 
