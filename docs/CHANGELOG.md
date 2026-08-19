@@ -10,7 +10,7 @@ Headline results live in the [README](../README.md); this file records how they 
 ## v3
 
 Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4515**, NDS 0.5186 ->
-**0.5553**. Latency 90.7 -> **65.2 ms/sample** (11.02 -> 15.34 FPS).
+**0.5553**. Latency 90.7 -> **57.4 ms/sample** (11.02 -> 17.41 FPS).
 
 ### Accuracy
 
@@ -51,6 +51,118 @@ Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4515**, NDS 0.51
 **`d5b833a` — grid_sample padding clamp used the input batch, not the grid's**
 
 ### Speed
+
+**frame pipeline: double-buffered image staging + prefetch loader** (branch perf/row-gather)
+
+- Three overlaps, all bit-identical (100-sample A/B, tokens aligned, exact):
+  1. `stage_next_images` packs, uploads and re-pages the NEXT frame's images
+     into the idle device slot while the current frame still computes — the
+     h2d write streams under running kernels (in-order CQ, no worker
+     dependency) and the ~2 ms re-page lands in the frame-boundary idle gap,
+     so forward() starts straight at the backbone. Two slots alternate; the
+     overwritten slot's last reader is a full frame of enqueued ops ahead in
+     the queue, far deeper than the dispatcher runs ahead of the workers
+  2. `get_sample` — 48.5 ms/frame of JPEG decode+resize, the single largest
+     per-sample cost and invisible in every forward median we ever reported —
+     runs on a worker thread under the previous frame's forward
+  3. outputs are read back ONCE (`read_outputs_to_host`) and decoded from
+     host tensors; --save-raw reuses the same read instead of a second one
+- forward median 62.5 -> **57.4 ms** (17.41 FPS); val wall 136.2 -> 90.0
+  ms/sample (40/100-sample means incl. cold frames). `--no-pipeline` restores
+  the serial reference loop
+- Python-only change (val loop + sparse4d.py); no kernel or .so rebuild
+
+**row_gather: one barrier per row instead of one per tile** (branch perf/row-gather)
+
+- The first version barriered inside every 32-element tile-row copy — 9
+  barriers per row on the instance-bank pair, 78 NOC ops serialised in
+  9 latency round-trips. Now all of a row's reads issue first, one barrier,
+  then all writes (plus `noc_async_writes_flushed` before the row buffer is
+  reused, which the old code skipped and got away with)
+- Also gained an RM mode (whole-stick copies, used by the gws-skip experiment)
+  and an optional-b form, `row_gather(src, idx, out, k=)`
+- Wall median 62.7 -> **62.3 ms** (16.05 FPS), 40 samples; bit-identical
+
+**gws dead-pair skip: bit-identical, machinery free — loses to DRAM locality, PARKED**
+(`TT_GWS_SKIP=1` opts in; default off)
+
+- The idea, from the GWS ablation (time is linear in CLP iterations, no
+  intercept): ~69% of (sorted-tile-row, sampling-point) iterations have
+  mask-zeroed weights; sort anchors by 3-bit camera-visibility pattern
+  (`anchor_bucket`, one-core integer counting sort -> perm/inv/live), skip
+  dead iterations wholesale, un-permute the output. Skipped terms are exactly
+  0.0, so outputs stay bit-identical — verified: synthetic A/B (3 runs) and
+  40 model samples both equal to the non-skip build
+- The count handshake works and costs nothing: the reader tallies live
+  iterations per work unit and posts (tag, count) into an L1-sharded mailbox
+  tensor all three TRISC threads spin on — MATH firmware has no
+  `cb_interface`, so a CB cannot carry it — with a +64/launch nonce so cached
+  launches never match a stale tag. Measured overhead at identity
+  permutation: 1046 vs 1023 us/call (+2%)
+- What kills it is physics, not machinery: permuted stick reads turn
+  sequential DRAM pages into random ones. At the real 31% live fraction the
+  op should cost 352 us and costs 996 — the surviving iterations pay ~3x in
+  DRAM row misses. Weight-row handling pays the same tax either way:
+  per-work-unit row gathers ~600 us/call, or a pre-permute via row_gather
+  ([928,1248] TILE, 39 scattered tiles/row) 400 us/call
+- End to end: baseline 62.7 -> 63.4 (skip v1) -> 65.3 ms (skip v2). Parked
+  rather than deleted: the fix that would work is permuting at scatter time
+  (write the rearrange buffer in sorted order via a remapped compaction
+  index, permute the weight-linear input instead of its output), ceiling
+  ~-2.5 ms/frame for another 5 moving parts
+- Hardware traps recorded: (1) NOC DRAM->L1 reads silently land shifted when
+  the L1 destination is not 32B-aligned — `anchor_bucket`'s per-camera flag
+  stride was 1800B and cameras 1/2 read garbage; (2) a <=12-page RM tensor
+  hides accessor page-size bugs, every page sits at offset 0 of its own bank
+
+**row_gather: paired row gather for the top-k selection** (branch perf/row-gather)
+
+- ttnn.gather ran the selection on 4 cores at 1.1 GB/s — pure NOC round-trip
+  latency, 655 us/call x4 — and each call needed a typecast/reshape/to_layout/
+  repeat_interleave chain just to expand the indices into gather's format
+- One op gathers the (features, anchors) pair off topk_select's uint32
+  ROW_MAJOR indices directly: rows fan out across cores, TILE face-row
+  segments copied with async NOC pipelining, both tensors ride one index read
+- 655 -> 55 us/call and 4 calls -> 2; the expansion chain disappears with it.
+  Device kernel total 61.79 -> 57.46 ms/frame, wall median 65.2 -> 62.7 ms
+  (15.94 FPS). Bit-identical (verified exact incl. duplicate indices;
+  5-sample model outputs equal to baseline). TT_ROW_GATHER=0 falls back
+
+**mlp_chain: fused (Linear-ReLU-LayerNorm)xN — built, verified, REMOVED**
+
+- One kernel runs a whole head MLP chain with weights resident in L1 and the
+  activation never leaving the core; LayerNorm is last-axis so tile-rows fan
+  out with zero cross-core traffic. Bias rides an augmented matmul strip
+  against a col0=1 constant tile
+- MORE accurate than the eager path it replaces (PCC vs torch 0.99995 vs
+  0.99984 — fp32 dest end to end) and passes chain-level verification
+- Speed-NEUTRAL, the pre-registered kill criterion: the fused call measured
+  ~186 us vs ~96-130 us of replaced ops; blocking DEST phases into 4s (fp32
+  half-sync capacity — using 8 silently spills into the other bank and
+  poisons the next acquire, a trap worth remembering) kept correctness but
+  the wall stayed at baseline. At 900 rows the in-kernel phase-chain latency
+  equals the op-boundary overhead it removes: eager's per-op pipelining was
+  already efficient here, the same lesson trace taught on the host side
+- Code removed after measurement (this entry is the record). Rebuild from this
+  description if a fused-chain attempt returns: the DEST blocking rule and the
+  const-pack contract (ones tile / augmented bias strip / gamma-beta rows) are
+  the two things that took real time to get right
+
+**trace execution: capture/replay works, wall LOSES ~5 ms — REMOVED**
+
+- Full-frame mesh trace capture/replay runs bit-identically (8/8 samples incl.
+  temporal state closed through canonical buffers), after three integration
+  rules the PoC established: trace_region_size at device open, warm the program
+  cache before capture, no inline scalar uploads inside the tape
+- End-to-end it is SLOWER than eager (+5 ms/f): eager dispatch already
+  overlaps host work with device execution via CQ backpressure, so the host
+  gap the trace was to reclaim was largely already hidden. Measured directly:
+  in-frame device idle is 0.5-1.7 ms/frame even under tracy's 2x host slowdown
+- Code removed after measurement (this entry is the record). What survives as
+  knowledge: the three capture rules above, the state-closure design (canonical
+  buffers + end-of-frame copies), and the finding that the remaining host cost
+  (~2-3 ms) is frame-BOUNDARY serial work — the fix is loop-level double
+  buffering, and the staging split described here is its prerequisite
 
 **fold the temporal anchor projection into one affine matmul** (branch perf/topk-kernel)
 

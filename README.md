@@ -20,8 +20,8 @@ Sparse4D v3 3D object detection, ported to Tenstorrent (Wormhole/Blackhole).
 
 |  | PyTorch | TT-NN Pure (N300) | ~~v1~~ | ~~v2~~ | **Custom Kernels v3 (N300)** |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Latency / sample** | ~95 ms | 235 ms | ~~122 ms~~ | ~~95.2 ms~~ | **65.2 ms** |
-| **FPS** | 10.5 | 4.2 | ~~8.2~~ | ~~10.51~~ | **15.34** |
+| **Latency / sample** | ~95 ms | 235 ms | ~~122 ms~~ | ~~95.2 ms~~ | **57.4 ms** |
+| **FPS** | 10.5 | 4.2 | ~~8.2~~ | ~~10.51~~ | **17.41** |
 
 - Metric: `model.forward` on one 6-camera sample
 - v3: median over a 6019-sample val run — mean 69.0 (steady-state, 4250-sample window)
