@@ -13,6 +13,7 @@ Usage:
 import argparse
 import copy
 import gc
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import pickle
@@ -723,6 +724,37 @@ def _yaw_to_quaternion(yaw):
     return Quaternion(axis=[0, 0, 1], radians=float(yaw))
 
 
+def read_outputs_to_host(outputs, mesh_device=None):
+    """One device->host read of the final-layer outputs.
+
+    Shared by --save-raw and the decoder so the same tensors are never read
+    twice, and callable BEFORE the next frame is enqueued — on the single
+    in-order CQ a read enqueued after the next frame's ops would wait for
+    that whole frame.
+    """
+    prediction = outputs["prediction"][-1]
+    classification = outputs["classification"][-1]
+    quality_list = outputs.get("quality", [])
+    quality = quality_list[-1] if quality_list and quality_list[-1] is not None else None
+    if prediction is None or classification is None:
+        return None
+
+    def _tt_to_torch(t):
+        if t is None:
+            return None
+        if isinstance(t, torch.Tensor):
+            return t.float()
+        if mesh_device is not None:
+            return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0)).float()[:1]
+        return ttnn.to_torch(t).float()
+
+    return {
+        "prediction": _tt_to_torch(prediction),
+        "classification": _tt_to_torch(classification),
+        "quality": _tt_to_torch(quality),
+    }
+
+
 def postprocess_to_nuscenes(
     outputs,
     info,
@@ -748,33 +780,17 @@ def postprocess_to_nuscenes(
     Returns:
         list of dicts in nuScenes submission format
     """
-    prediction = outputs["prediction"][-1]
-    classification = outputs["classification"][-1]
-    quality_list = outputs.get("quality", [])
-    quality = quality_list[-1] if quality_list and quality_list[-1] is not None else None
+    host = read_outputs_to_host(outputs, mesh_device)
+    return decode_host_outputs(host, info, eval_config, max_dets=max_dets)
 
-    if prediction is None or classification is None:
+
+def decode_host_outputs(host, info, eval_config, max_dets=300):
+    """Decode already-read host outputs to nuScenes format (pure host math)."""
+    if host is None:
         return []
-
-    # To host
-    def _tt_to_torch(t, mesh_dev=None):
-        if isinstance(t, torch.Tensor):
-            return t.float()
-        if mesh_dev is not None:
-            return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_dev, dim=0)).float()[:1]
-        return ttnn.to_torch(t).float()
-
-    pred = _tt_to_torch(prediction, mesh_device)
-    cls = _tt_to_torch(classification, mesh_device)
-
-    if quality is not None:
-        qt = _tt_to_torch(quality, mesh_device)
-        qt = qt[0]  # [num_anchor, num_quality]
-    else:
-        qt = None
-
-    pred = pred[0]  # [num_anchor, 11]
-    cls = cls[0]  # [num_anchor, num_cls]
+    pred = host["prediction"][0]  # [num_anchor, 11]
+    cls = host["classification"][0]  # [num_anchor, num_cls]
+    qt = host["quality"][0] if host["quality"] is not None else None
 
     num_cls = cls.shape[-1]
     cls_scores = cls.sigmoid()  # [num_anchor, num_cls]
@@ -1125,6 +1141,11 @@ def main():
         help="(deprecated, now always single device) Kept for backward compatibility",
     )
     parser.add_argument(
+        "--no-pipeline",
+        action="store_true",
+        help="Disable the prefetch/staging pipeline (serial reference loop)",
+    )
+    parser.add_argument(
         "--save-raw",
         type=str,
         default=None,
@@ -1247,87 +1268,114 @@ def main():
         processed = 0
         frame_ms = []          # per-frame model.forward, for the median/p90 report
 
-        # Process scene by scene for temporal coherence
+        # Pipelined loop over a flat (scene, sample) list. Three overlaps, all
+        # bit-identical to the serial loop:
+        #   1. get_sample (~48 ms of JPEG decode, the single largest per-sample
+        #      cost) runs on a worker thread under the previous frame's forward
+        #   2. the next frame's images are packed/uploaded/re-paged while the
+        #      device still runs this frame (model.stage_next_images)
+        #   3. outputs are read back ONCE and decoded from host tensors
+        # --no-pipeline restores the serial order for A/B.
+        pipeline = not args.no_pipeline
+        flat = []
         for scene_idx, scene_samples in enumerate(loader.scenes):
-            model.reset()  # Reset temporal cache at scene boundary
-
-            for sample_idx_in_scene, global_idx in enumerate(scene_samples):
-                if processed >= total_samples:
+            for global_idx in scene_samples:
+                if len(flat) >= total_samples:
                     break
-
-                images, metas, info = loader.get_sample(global_idx)
-                token = info["token"]
-
-                t0 = time.time()
-                outputs = model.forward(images, metas, bs=1)
-                elapsed = time.time() - t0
-                total_time += elapsed
-                frame_ms.append(elapsed * 1e3)
-                processed += 1
-
-                # Save raw outputs if requested
-                if args.save_raw:
-                    raw_pred = outputs["prediction"][-1]
-                    raw_cls = outputs["classification"][-1]
-                    raw_qt_list = outputs.get("quality", [])
-                    raw_qt = raw_qt_list[-1] if raw_qt_list and raw_qt_list[-1] is not None else None
-
-                    def _to_cpu(t):
-                        if t is None:
-                            return None
-                        if isinstance(t, torch.Tensor):
-                            return t.cpu().float()
-                        if mesh_device is not None:
-                            return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0)).cpu().float()[:1]
-                        return ttnn.to_torch(t).cpu().float()
-
-                    entry = {
-                        "token": token,
-                        "prediction": _to_cpu(raw_pred)[0],  # [900, 11]
-                        "classification": _to_cpu(raw_cls)[0],  # [900, 10]
-                    }
-                    qt_val = _to_cpu(raw_qt)
-                    if qt_val is not None:
-                        entry["quality"] = qt_val[0]  # [900, 2]
-                    raw_outputs.append(entry)
-
-                # Post-process (PyTorch-identical: NuScenesBox + range filter)
-                dets = postprocess_to_nuscenes(
-                    outputs,
-                    info,
-                    eval_config,
-                    mesh_device=mesh_device,
-                )
-
-                # Add sample_token to each detection
-                for d in dets:
-                    d["sample_token"] = token
-                all_results[token] = dets
-
-                # Periodic GC to prevent host memory leak from to_torch/from_torch
-                if processed % 100 == 0:
-                    gc.collect()
-
-                if processed % 50 == 0 or processed == total_samples:
-                    # Milliseconds to one decimal, not seconds to two. On the old grid a
-                    # sample landed in a 10 ms bucket, which is coarser than most of the
-                    # optimisations this script is used to judge — a 4 ms win reads as no
-                    # change at all. The steady-state median matters more than the mean,
-                    # which stays skewed for hundreds of frames by kernel compilation, so
-                    # both are printed.
-                    warm = sorted(frame_ms[10:]) or sorted(frame_ms)
-                    med = warm[len(warm) // 2]
-                    print(
-                        f"  [{processed}/{total_samples}] "
-                        f"{elapsed * 1e3:6.1f} ms  "
-                        f"median {med:6.1f}  "
-                        f"mean {1e3 * total_time / processed:6.1f}  "
-                        f"{1000.0 / med:5.2f} FPS  "
-                        f"{len(dets)} dets"
-                    )
-
-            if processed >= total_samples:
+                flat.append((scene_idx, global_idx))
+            if len(flat) >= total_samples:
                 break
+
+        pool = ThreadPoolExecutor(max_workers=1) if pipeline else None
+        fut = None          # one outstanding get_sample
+        next_loaded = None  # its result, once staged
+        idx_next = 1
+        if pipeline:
+            fut = pool.submit(loader.get_sample, flat[0][1])
+        cur_scene = None
+        wall0 = time.time()
+
+        for k, (scene_idx, global_idx) in enumerate(flat):
+            if pipeline:
+                if next_loaded is not None:
+                    images, metas, info = next_loaded
+                    next_loaded = None
+                else:
+                    images, metas, info = fut.result()
+                    fut = (pool.submit(loader.get_sample, flat[idx_next][1])
+                           if idx_next < len(flat) else None)
+                    idx_next += 1
+            else:
+                images, metas, info = loader.get_sample(global_idx)
+            token = info["token"]
+
+            if scene_idx != cur_scene:
+                model.reset()  # Reset temporal cache at scene boundary
+                cur_scene = scene_idx
+
+            t0 = time.time()
+            outputs = model.forward(images, metas, bs=1)
+            elapsed = time.time() - t0
+            total_time += elapsed
+            frame_ms.append(elapsed * 1e3)
+            processed += 1
+
+            # Stage the next frame before the blocking readback: its h2d write
+            # streams while the device finishes this frame, its re-page fills
+            # the boundary idle gap
+            if pipeline and fut is not None:
+                next_loaded = fut.result()
+                fut = (pool.submit(loader.get_sample, flat[idx_next][1])
+                       if idx_next < len(flat) else None)
+                idx_next += 1
+                model.stage_next_images(next_loaded[0])
+
+            # One read for both --save-raw and the decoder (waits for the device)
+            host_out = read_outputs_to_host(outputs, mesh_device=mesh_device)
+
+            if args.save_raw and host_out is not None:
+                entry = {
+                    "token": token,
+                    "prediction": host_out["prediction"][0],  # [900, 11]
+                    "classification": host_out["classification"][0],  # [900, 10]
+                }
+                if host_out["quality"] is not None:
+                    entry["quality"] = host_out["quality"][0]  # [900, 2]
+                raw_outputs.append(entry)
+
+            # Post-process (PyTorch-identical: NuScenesBox + range filter)
+            dets = decode_host_outputs(host_out, info, eval_config)
+
+            # Add sample_token to each detection
+            for d in dets:
+                d["sample_token"] = token
+            all_results[token] = dets
+
+            # Periodic GC to prevent host memory leak from to_torch/from_torch
+            if processed % 100 == 0:
+                gc.collect()
+
+            if processed % 50 == 0 or processed == total_samples:
+                # Milliseconds to one decimal, not seconds to two. On the old grid a
+                # sample landed in a 10 ms bucket, which is coarser than most of the
+                # optimisations this script is used to judge — a 4 ms win reads as no
+                # change at all. The steady-state median matters more than the mean,
+                # which stays skewed for hundreds of frames by kernel compilation, so
+                # both are printed.
+                warm = sorted(frame_ms[10:]) or sorted(frame_ms)
+                med = warm[len(warm) // 2]
+                wall_ms = 1e3 * (time.time() - wall0) / processed
+                print(
+                    f"  [{processed}/{total_samples}] "
+                    f"{elapsed * 1e3:6.1f} ms  "
+                    f"median {med:6.1f}  "
+                    f"mean {1e3 * total_time / processed:6.1f}  "
+                    f"{1000.0 / med:5.2f} FPS  "
+                    f"wall {wall_ms:6.1f} ms/sample  "
+                    f"{len(dets)} dets"
+                )
+        if pool is not None:
+            pool.shutdown(wait=False)
 
         # Report the distribution, not one number. The mean carries the cold frames, the
         # median is what the model actually runs at, and p90/max are where a scene with an
