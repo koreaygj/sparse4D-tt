@@ -33,6 +33,10 @@ tt::tt_metal::Tensor grouped_weighted_sum(
     const tt::tt_metal::Tensor& features,
     const tt::tt_metal::Tensor& weights,
     uint32_t num_groups, uint32_t group_dims,
-    const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt);
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt,
+    const std::optional<tt::tt_metal::Tensor>& perm = std::nullopt,
+    const std::optional<tt::tt_metal::Tensor>& live = std::nullopt,
+    uint32_t clp_per_cam = 0,
+    const std::optional<tt::tt_metal::Tensor>& mbox = std::nullopt);
 
 }  // namespace ttnn::prim

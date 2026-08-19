@@ -27,7 +27,9 @@ void bind_grouped_weighted_sum(nb::module_& mod) {
         mod, doc, &ttnn::grouped_weighted_sum,
         nb::arg("features"), nb::arg("weights"),
         nb::arg("num_groups"), nb::arg("group_dims"),
-        nb::kw_only(), nb::arg("memory_config") = nb::none());
+        nb::kw_only(), nb::arg("memory_config") = nb::none(),
+        nb::arg("perm") = nb::none(), nb::arg("live") = nb::none(),
+        nb::arg("clp_per_cam") = 0, nb::arg("mbox") = nb::none());
 }
 
 }  // namespace ttnn::operations::grouped_weighted_sum

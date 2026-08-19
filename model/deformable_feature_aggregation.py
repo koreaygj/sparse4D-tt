@@ -26,6 +26,19 @@ import ttnn
 # TT_CUSTOM_KERNELS=0 → force pure ttnn, TT_CUSTOM_KERNELS=1 → force custom kernels
 import os as _os
 _KERNELS_AVAILABLE = all(hasattr(ttnn, op) for op in ["kps_project_fused", "transposed_s2i", "grouped_weighted_sum"])
+
+# Dead-pair skip for grouped_weighted_sum: anchors bucketed by camera
+# visibility (anchor_bucket) so the gws reader can skip the ~75-80% of
+# (tile-row, clp) iterations whose weights the mask zeroed anyway. Ablation
+# measured gws time linear in clp iterations (1003/451/238 us at 156/78/40),
+# so the skip converts ~1:1. Output is bit-identical: every skipped term is
+# exactly 0.0. PARKED (TT_GWS_SKIP=1 opts in): bit-identical but slower —
+# the permuted stick reads lose DRAM locality and the surviving 31% of
+# iterations run ~3x slower, erasing the win (see CHANGELOG 2026-08-19).
+_GWS_SKIP = (
+    all(hasattr(ttnn, op) for op in ["anchor_bucket", "row_gather"])
+    and _os.environ.get("TT_GWS_SKIP", "0") == "1"
+)
 _env = _os.environ.get("TT_CUSTOM_KERNELS")
 if _env is not None:
     _HAS_CUSTOM_KERNELS = _env == "1"
@@ -1123,6 +1136,42 @@ class DeformableFeatureAggregation:
                 torch.zeros(1, 1, self._oob_cap, 8, dtype=torch.int32),
                 dtype=ttnn.uint32, **_kw,
             )
+            if _GWS_SKIP:
+                npad = ((n + 31) // 32) * 32
+                self._ab_perm = ttnn.from_torch(
+                    torch.zeros(1, 1, 1, npad, dtype=torch.int32), dtype=ttnn.uint32, **_kw)
+                self._ab_inv = ttnn.from_torch(
+                    torch.zeros(1, 1, 1, npad, dtype=torch.int32), dtype=ttnn.uint32, **_kw)
+                self._ab_live = ttnn.from_torch(
+                    torch.zeros(1, 1, 1, 32, dtype=torch.int32), dtype=ttnn.uint32, **_kw)
+                # weights permuted into sorted-anchor order, once per gws call —
+                # the reader then reads them tile-cached like the non-skip path
+                _wkw = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                            device=self.device)
+                if self._mesh_device is not None:
+                    _wkw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                self._wt_perm = ttnn.from_torch(
+                    torch.zeros(n, nc * self.num_levels * self.num_pts
+                                * self.num_groups), **_wkw)
+                self._gws_unperm = None  # lazy: matches the fused feature shape
+                # Count mailbox: L1-sharded so every core's 32-word shard sits
+                # at ONE base address the kernels get as a plain runtime arg —
+                # the MATH thread has no cb_interface, so a CB cannot carry it.
+                _grid = self.device.compute_with_storage_grid_size()
+                _mbox_shard = ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(
+                            ttnn.CoreCoord(0, 0),
+                            ttnn.CoreCoord(_grid.x - 1, _grid.y - 1))}),
+                        [1, 32], ttnn.ShardOrientation.ROW_MAJOR))
+                _mkw = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device,
+                            memory_config=_mbox_shard)
+                if self._mesh_device is not None:
+                    _mkw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                self._gws_mbox = ttnn.from_torch(
+                    torch.zeros(1, 1, _grid.x * _grid.y, 32, dtype=torch.int32),
+                    dtype=ttnn.uint32, **_mkw)
 
         # With align_corners=False a point contributes iff g is in [-1 - 1/S, 1 + 1/S),
         # S being W on x and H on y. Take the loosest LEVEL so one compaction serves all
@@ -1135,6 +1184,9 @@ class DeformableFeatureAggregation:
             num_pts=self.num_pts, capacity=self._oob_cap, anchors=n,
             threshold_x=thr_x, threshold_y=thr_y, bidx=self._cbidx,
         )
+        if _GWS_SKIP:
+            ttnn.anchor_bucket(self._cflags, self._ab_perm, self._ab_inv,
+                               self._ab_live, num_anchors=n)
         return (
             ttnn.to_memory_config(self._cgrid, self._cgrid_sharded_mem),
             ttnn.to_memory_config(self._cbidx, self._cbidx_sharded_mem),
@@ -1308,10 +1360,20 @@ class DeformableFeatureAggregation:
             # 137 MB DRAM round trip per call — is not needed. RM_MODE is only correct
             # with the kernel fix that configures both compute pipelines before the loop;
             # without it the op is wrong on its first call after any other op has run.
-            gws_out = ttnn.grouped_weighted_sum(
-                self._rearrange_buf, weights_t,
-                num_groups=self.num_groups, group_dims=self.group_dims,
-            )
+            if _GWS_SKIP:
+                ttnn.row_gather(weights_t, self._ab_perm, self._wt_perm, k=n)
+                gws_out = ttnn.grouped_weighted_sum(
+                    self._rearrange_buf, self._wt_perm,
+                    num_groups=self.num_groups, group_dims=self.group_dims,
+                    perm=self._ab_perm, live=self._ab_live,
+                    clp_per_cam=self.num_levels * self.num_pts,
+                    mbox=self._gws_mbox,
+                )
+            else:
+                gws_out = ttnn.grouped_weighted_sum(
+                    self._rearrange_buf, weights_t,
+                    num_groups=self.num_groups, group_dims=self.group_dims,
+                )
             ttnn.deallocate(weights_t)
             n_padded = ((n + 31) // 32) * 32
             chunk0 = ttnn.slice(gws_out, [0, 0], [n, self.embed_dims])
@@ -1320,6 +1382,18 @@ class DeformableFeatureAggregation:
             features = ttnn.add(chunk0, chunk1)
             ttnn.deallocate(chunk0)
             ttnn.deallocate(chunk1)
+            if _GWS_SKIP:
+                # rows came out in sorted-anchor order; un-permute via inv
+                if self._gws_unperm is None:
+                    _ukw = dict(layout=features.layout, device=self.device,
+                                dtype=features.dtype)
+                    if self._mesh_device is not None:
+                        _ukw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                    self._gws_unperm = ttnn.from_torch(
+                        torch.zeros(n, self.embed_dims), **_ukw)
+                ttnn.row_gather(features, self._ab_inv, self._gws_unperm, k=n)
+                ttnn.deallocate(features)
+                features = self._gws_unperm
         else:
             # === Fallback path: original pure ttnn ops (from pre-kernel commit bc5e388) ===
             ttnn.deallocate(anchor_rm)

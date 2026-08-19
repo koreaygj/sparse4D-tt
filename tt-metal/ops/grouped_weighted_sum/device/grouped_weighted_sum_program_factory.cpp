@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
+#include <cstdlib>
 #include "tt-metalium/work_split.hpp"
 #include "tt-metalium/tensor_accessor_args.hpp"
 #include "ttnn/operations/cb_utils.hpp"
@@ -23,7 +24,15 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
     Program program{};
     IDevice* const device = output_tensor.device();
 
-    const uint32_t n = t.features.logical_shape()[0];    // CLP (batch/reduction)
+    uint32_t n = t.features.logical_shape()[0];          // CLP (batch/reduction)
+    if (const char* ab = std::getenv("TT_GWS_ABLATE_CLP")) {
+        // TIMING ABLATION ONLY: process just the first N reduction rows to
+        // measure how the op scales with CLP depth. The output becomes a
+        // partial sum — never set outside profiling runs. Use values whose
+        // chunking stays exact (n divisible by num_chunks) or the compute
+        // kernel waits for pages the clamped reader never sends.
+        n = std::min<uint32_t>(n, (uint32_t)atoi(ab));
+    }
     const uint32_t clp = t.features.logical_shape()[1];  // N (output anchors)
     const uint32_t G = attrs.num_groups;
     const uint32_t D = attrs.group_dims;
@@ -61,6 +70,15 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
     const uint32_t rm_stick_size = embed_dims * t.features.element_size();
     const uint32_t N_total = rm_mode ? t.features.logical_shape()[1] : 0;
 
+    // Dead-pair skip needs the sorted-anchor tables and the compact weights.
+    const bool skip_mode = t.perm.has_value() && attrs.clp_per_cam > 0;
+    uint32_t prm_cb = 0;
+    if (skip_mode) {
+        const uint32_t prm_bytes = ((N_total * 4 + 31) & ~31u) + 128;
+        auto [pm, _p] = create_cb(cb_idx++, program, all_cores, prm_bytes, 1, DataFormat::UInt32);
+        prm_cb = pm;
+    }
+
     // Reader
     std::vector<uint32_t> reader_ct_args = {
         feat_cb, wt_raw_cb, wt_col_cb,
@@ -81,6 +99,9 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
     const bool wt_compact = t.weights.logical_shape()[-1] == static_cast<int32_t>(G * n);
     reader_ct_args.push_back(wt_compact ? 1U : 0U);                 // WT_COMPACT
     reader_ct_args.push_back(wt_compact ? (G * n) / 32 : 0U);       // WT_TC: tiles per row
+    reader_ct_args.push_back(skip_mode ? 1U : 0U);                  // SKIP_MODE
+    reader_ct_args.push_back(attrs.clp_per_cam);                    // CLP_PER_CAM
+    reader_ct_args.push_back(prm_cb);                               // PRM_CB
 
     auto reader_kernel_id = CreateKernel(program,
         "ttnn/cpp/ttnn/operations/pool/grouped_weighted_sum/device/kernels/dataflow/reader_grouped_weighted_sum.cpp",
@@ -97,6 +118,7 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
         G,                                    // 3
         rm_mode ? 1U : 0U,                   // 4: RM_MODE
         rm_mode ? tile_cb : feat_cb,          // 5: tile_cb (intermediate for RM)
+        skip_mode ? 1U : 0U,                  // 6: SKIP_MODE
     };
     auto compute_kernel_id = CreateKernel(program,
         "ttnn/cpp/ttnn/operations/pool/grouped_weighted_sum/device/kernels/compute/compute_grouped_weighted_sum.cpp",
@@ -127,12 +149,18 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
             num_output_tile_rows, // for deriving tile_row from WU
             chunk_size,         // CLP batches per chunk
             n,                  // total CLP batches
+            skip_mode ? t.perm->buffer()->address() : 0u,   // 7
+            skip_mode ? t.live->buffer()->address() : 0u,   // 8
+            64u,                // 9: mailbox nonce (bumped every launch)
+            skip_mode ? t.mbox->buffer()->address() : 0u,   // 10
         });
 
         SetRuntimeArgs(program, compute_kernel_id, core, {
             core_wus,           // num work units
             chunk_size,         // max CLP per chunk (for compute loop)
             n,                  // total CLP
+            64u,                // 3: mailbox nonce (bumped every launch)
+            skip_mode ? t.mbox->buffer()->address() : 0u,   // 4
         });
 
         SetRuntimeArgs(program, writer_kernel_id, core, {
@@ -148,16 +176,24 @@ GroupedWeightedSumProgramFactory::cached_program_t GroupedWeightedSumProgramFact
 
     return cached_program_t{std::move(program),
         shared_variables_t{.reader_kernel_id=reader_kernel_id, .writer_kernel_id=writer_kernel_id,
+                           .compute_kernel_id=compute_kernel_id, .launch_seq=64u,
                            .num_cores=num_cores, .logical_cores=logical_cores}};
 }
 
 void GroupedWeightedSumProgramFactory::override_runtime_arguments(
     cached_program_t& cp, const GroupedWeightedSumParams&,
     const GroupedWeightedSumInputs& t, Tensor& out) {
-    auto& p = cp.program; const auto& sv = cp.shared_variables;
+    auto& p = cp.program; auto& sv = cp.shared_variables;
+    sv.launch_seq += 64u;   // tags: nonce + wu, wu < 64, so no value ever repeats
     for (uint32_t i = 0; i < sv.num_cores; i++) {
         auto& r = GetRuntimeArgs(p, sv.reader_kernel_id, sv.logical_cores[i]);
         r[0] = t.features.buffer()->address(); r[1] = t.weights.buffer()->address();
+        if (t.perm.has_value()) {
+            r[7] = t.perm->buffer()->address();
+            r[8] = t.live->buffer()->address();
+            r[9] = sv.launch_seq;
+            GetRuntimeArgs(p, sv.compute_kernel_id, sv.logical_cores[i])[3] = sv.launch_seq;
+        }
         GetRuntimeArgs(p, sv.writer_kernel_id, sv.logical_cores[i])[0] = out.buffer()->address();
     }
 }

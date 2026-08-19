@@ -12,6 +12,11 @@ struct GroupedWeightedSumProgramFactory {
     struct shared_variables_t {
         tt::tt_metal::KernelHandle reader_kernel_id;
         tt::tt_metal::KernelHandle writer_kernel_id;
+        tt::tt_metal::KernelHandle compute_kernel_id;
+        // Launch nonce for the skip-mode mailbox: tags must never repeat
+        // across launches or a cached-program re-run matches last frame's
+        // stale tag before the reader writes this frame's count.
+        uint32_t launch_seq;
         uint32_t num_cores;
         std::vector<tt::tt_metal::CoreCoord> logical_cores;
     };

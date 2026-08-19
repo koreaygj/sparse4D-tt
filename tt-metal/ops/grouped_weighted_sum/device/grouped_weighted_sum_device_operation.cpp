@@ -17,6 +17,17 @@ GroupedWeightedSumOperation::program_factory_t GroupedWeightedSumOperation::sele
 
 void GroupedWeightedSumOperation::validate_on_program_cache_miss(
     const operation_attributes_t& attrs, const tensor_args_t& t) {
+    if (t.perm.has_value()) {
+        TT_FATAL(attrs.clp_per_cam > 0, "skip mode needs clp_per_cam");
+        TT_FATAL(t.live.has_value(), "skip mode needs the live bitmap");
+        TT_FATAL(t.mbox.has_value(), "skip mode needs the L1 mailbox tensor");
+        TT_FATAL(t.features.layout() == Layout::ROW_MAJOR, "skip mode is RM-only");
+        TT_FATAL(t.perm->dtype() == DataType::UINT32 && t.perm->layout() == Layout::ROW_MAJOR,
+                 "perm must be uint32 ROW_MAJOR");
+        TT_FATAL(t.live->dtype() == DataType::UINT32 && t.live->layout() == Layout::ROW_MAJOR,
+                 "live must be uint32 ROW_MAJOR");
+    }
+
     TT_FATAL(t.features.storage_type() == StorageType::DEVICE, "features must be on device");
     TT_FATAL(t.weights.storage_type() == StorageType::DEVICE, "weights must be on device");
     TT_FATAL(t.features.layout() == Layout::TILE || t.features.layout() == Layout::ROW_MAJOR,
@@ -70,14 +81,20 @@ Tensor GroupedWeightedSumOperation::create_output_tensors(
 Tensor grouped_weighted_sum(
     const Tensor& features, const Tensor& weights,
     uint32_t num_groups, uint32_t group_dims,
-    const std::optional<MemoryConfig>& memory_config) {
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& perm,
+    const std::optional<Tensor>& live,
+    uint32_t clp_per_cam,
+    const std::optional<Tensor>& mbox) {
     using Op = GroupedWeightedSumOperation;
     return ttnn::device_operation::launch<Op>(
         Op::operation_attributes_t{
             .num_groups = num_groups, .group_dims = group_dims,
+            .clp_per_cam = perm.has_value() ? clp_per_cam : 0u,
             .output_mem_config = memory_config.value_or(features.memory_config()),
         },
-        Op::tensor_args_t{.features = features, .weights = weights});
+        Op::tensor_args_t{.features = features, .weights = weights,
+                          .perm = perm, .live = live, .mbox = mbox});
 }
 
 }  // namespace ttnn::prim

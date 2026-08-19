@@ -20,10 +20,21 @@ void kernel_main() {
     constexpr uint32_t G         = get_compile_time_arg_val(3);
     constexpr uint32_t RM_MODE   = get_compile_time_arg_val(4);
     constexpr uint32_t tile_cb   = get_compile_time_arg_val(5);
+    // SKIP_MODE: the reader decides per work unit how many clp iterations are
+    // live (dead-camera rows are skipped) and promises the count in a header
+    // page. Control flow here runs identically on all three TRISCs, so a plain
+    // L1 read of the count is race-free — the same mechanism get_arg_val uses.
+    constexpr uint32_t SKIP_MODE = get_compile_time_arg_val(6);
 
     uint32_t num_wus     = get_arg_val<uint32_t>(0);
     uint32_t chunk_size  = get_arg_val<uint32_t>(1);
     uint32_t total_clp   = get_arg_val<uint32_t>(2);
+    uint32_t mbox_nonce  = get_arg_val<uint32_t>(3);
+    // Absolute L1 address of the per-core mailbox (an L1-sharded tensor whose
+    // shards sit at the SAME address on every core). MATH has no cb_interface
+    // at all in firmware, so a CB cannot carry this — a raw address can: every
+    // TRISC is a RISC-V core with plain L1 loads.
+    uint32_t mbox_addr   = get_arg_val<uint32_t>(4);
 
     if constexpr (RM_MODE) {
         // Configure BOTH pipelines up front. The loop below alternates between tilize and
@@ -38,7 +49,17 @@ void kernel_main() {
         for (uint32_t wu = 0; wu < num_wus; wu++) {
             cb_reserve_back(out_cb, G);
 
-            for (uint32_t clp = 0; clp < chunk_size; clp++) {
+            uint32_t iters = chunk_size;
+            if constexpr (SKIP_MODE) {
+                // all three TRISC threads execute this control flow; each
+                // spins until the reader tags this work unit's slot
+                volatile uint32_t* mbox = (volatile uint32_t*)mbox_addr;
+                const uint32_t slot = (wu & 3u) * 2u;
+                while (mbox[slot] != mbox_nonce + wu) {
+                }
+                iters = mbox[slot + 1];
+            }
+            for (uint32_t clp = 0; clp < iters; clp++) {
                 // 1. Tilize RM→TILE.
                 // L1 accumulate must be OFF here: tile_cb is only G pages deep, so every
                 // iteration packs to the same L1 address. With acc still enabled from the
@@ -86,7 +107,17 @@ void kernel_main() {
         for (uint32_t wu = 0; wu < num_wus; wu++) {
             cb_reserve_back(out_cb, G);
 
-            for (uint32_t clp = 0; clp < chunk_size; clp++) {
+            uint32_t iters = chunk_size;
+            if constexpr (SKIP_MODE) {
+                // all three TRISC threads execute this control flow; each
+                // spins until the reader tags this work unit's slot
+                volatile uint32_t* mbox = (volatile uint32_t*)mbox_addr;
+                const uint32_t slot = (wu & 3u) * 2u;
+                while (mbox[slot] != mbox_nonce + wu) {
+                }
+                iters = mbox[slot + 1];
+            }
+            for (uint32_t clp = 0; clp < iters; clp++) {
                 cb_wait_front(feat_cb, G);
                 cb_wait_front(wt_cb, G);
                 pack_reconfig_l1_acc(clp > 0 ? 1 : 0);
