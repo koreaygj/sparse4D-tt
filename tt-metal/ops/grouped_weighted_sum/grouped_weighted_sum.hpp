@@ -13,7 +13,11 @@ ttnn::Tensor grouped_weighted_sum(
     const ttnn::Tensor& weights,    // [n, clp, num_groups] ROW_MAJOR bf16
     uint32_t num_groups,
     uint32_t group_dims,
-    const std::optional<MemoryConfig>& memory_config = std::nullopt);
+    const std::optional<MemoryConfig>& memory_config = std::nullopt,
+    const std::optional<ttnn::Tensor>& perm = std::nullopt,
+    const std::optional<ttnn::Tensor>& live = std::nullopt,
+    uint32_t clp_per_cam = 0,
+    const std::optional<ttnn::Tensor>& mbox = std::nullopt);
 
 }  // namespace operations::grouped_weighted_sum
 using ttnn::operations::grouped_weighted_sum::grouped_weighted_sum;

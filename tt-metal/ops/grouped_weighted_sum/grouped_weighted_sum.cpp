@@ -12,9 +12,13 @@ tt::tt_metal::Tensor grouped_weighted_sum(
     const tt::tt_metal::Tensor& weights,
     uint32_t num_groups,
     uint32_t group_dims,
-    const std::optional<tt::tt_metal::MemoryConfig>& memory_config) {
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    const std::optional<tt::tt_metal::Tensor>& perm,
+    const std::optional<tt::tt_metal::Tensor>& live,
+    uint32_t clp_per_cam,
+    const std::optional<tt::tt_metal::Tensor>& mbox) {
     return ttnn::prim::grouped_weighted_sum(
-        features, weights, num_groups, group_dims, memory_config);
+        features, weights, num_groups, group_dims, memory_config, perm, live, clp_per_cam, mbox);
 }
 
 }  // namespace ttnn::operations::grouped_weighted_sum

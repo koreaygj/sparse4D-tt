@@ -91,7 +91,7 @@ void kernel_main() {
                 input_chunk_nbytes,
                 last_chunk_partial,
                 input_cb_index,
-                scalar_cb_index>(noc, input_cb, scalar_cb, grid_ptr, grid_idx, input_tensor_accessor, batch_offset);
+                scalar_cb_index>(noc, input_cb, scalar_cb, grid_ptr, grid_idx, grid_batches, input_tensor_accessor, batch_offset);
         }
 
         // Update batch tracking (avoid division in loop)

@@ -9,8 +9,8 @@ Headline results live in the [README](../README.md); this file records how they 
 
 ## v3
 
-Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4480**, NDS 0.5186 ->
-**0.5520**. Latency 90.7 -> **77.7 ms/sample** (11.02 -> 12.86 FPS).
+Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4515**, NDS 0.5186 ->
+**0.5553**. Latency 90.7 -> **65.2 ms/sample** (11.02 -> 15.34 FPS).
 
 ### Accuracy
 
@@ -51,6 +51,75 @@ Full val, 6019 samples, `sparse4dv3_r50.pth`: mAP 0.4019 -> **0.4480**, NDS 0.51
 **`d5b833a` — grid_sample padding clamp used the input batch, not the grid's**
 
 ### Speed
+
+**fold the temporal anchor projection into one affine matmul** (branch perf/topk-kernel)
+
+- The projection is linear in every anchor field, so the 13-op slice/matmul/concat
+  chain (plus 4 h2d uploads/frame) folds into anchor @ A + b with A built on host
+  from the frame's ego pose. Wall 67.2 -> 66.4 ms
+- Full val: mAP 0.4482 -> **0.4515**, NDS **0.5553**, mATE 0.5615 -> 0.5492, mAOE
+  0.4851 -> 0.4710 — the fold is MORE precise than the chain it replaced (one
+  fp32 matmul instead of repeated bf16 intermediate roundings), so the temporal
+  anchors improve and accuracy sets a new project best
+
+**make linear's relu a real fused epilogue** (branch perf/topk-kernel)
+
+- `ttnn.linear(activation="relu")` silently does NOT fuse without a user core
+  grid: matmul.cpp runs the activation as a separate unary op afterwards. The
+  encoder and refinement chains believed they were fused — the profile showed
+  168 stray RELU ops/frame (1.75 ms device + ~0.7 ms host dispatch)
+- Fix is `core_grid=ttnn.CoreGrid(y=8, x=8)` on those linears, which routes the
+  relu into the matmul program config. Bit-identical (relu commutes with bf16
+  rounding), verified PCC 1.0 on 5-sample raw outputs
+- Wall median 66.4 -> 65.2 ms (15.34 FPS); full val bit-identical to the fold build
+- Width-fusion survey alongside this: QKV and weights_fc were already fused;
+  the encoder (unequal 128/32/32/64 branches) and head chains are blocked by
+  per-branch LayerNorm — ttnn.group_norm as a segmented-LN substitute measured
+  10x worse than layer_norm (mean err 0.052 vs 0.0044, PCC 0.9983) and was
+  rejected
+
+**topk_select: radix-sort top-k for the instance bank** (branch perf/topk-kernel)
+
+- ttnn.topk tile-pads the [1, 900] confidence row to 32 x 928 and bitonic-sorts
+  all 32 rows on ONE core — 97% of its work is tile padding. The two calls
+  (top-300 merge, top-600 cache) cost 1.89 + 2.76 ms/frame
+- New op reads only the real row (two 32 B face-row reads per tile, no untilize
+  op) and sorts with a 2-pass LSD radix over bf16 bits mapped to monotonic
+  uint16 keys — pure integer work, immune to the FPU-less-core soft-float trap.
+  Emits uint32 indices directly, absorbing the typecast that followed
+- 1893/2759 -> 161 us/call. Device kernel total 65.93 -> 61.94 ms/frame; wall
+  median 68.6 -> 67.2 ms (14.87 FPS) — the wall keeps ~2.6 ms less than the
+  device saving because the frame is now partly host-bound
+- Ordering: descending, ties to the LOWER index (torch semantics, verified
+  16/16 against a stable reference incl. 100-way ties). ttnn.topk leaves tie
+  order unspecified, so this is not bit-identical to the fallback on tied
+  confidences; full val gates the swap. TT_TOPK_KERNEL=0 restores ttnn.topk
+
+**`a5728ad` — row-major FPN 3x3 conv IO to skip conv2d's internal reshapes**
+
+- The FPN 3x3 convs fall into conv2d's DRAM-slice mode, which reshapes its input
+  flat -> NHWC and its output NHWC -> flat internally. On TILE tensors both moves are
+  real (885 + 868 us at level 0 alone); on ROW_MAJOR with the channel dim unchanged
+  they are free views
+- Two lines: untilize the conv input, `output_layout=ROW_MAJOR` on the conv. The RM
+  output also suits the consumer — DFA reads these maps as RM NHWC for grid_sample
+- ReshapeView 5.34 -> 3.38 ms/frame, no tilize/untilize growth. Device kernel total
+  68.63 -> 66.61 ms/frame, wall median 71.7 -> 69.7 ms. Full val bit-identical
+  (mAP 0.4487746)
+
+**`e39a78c` — block-diagonal weights_fc emits folded attention rows directly**
+
+- The camera-embed linear produced `[N*cams, 416]` with the camera in the row axis;
+  folding it to the `[N, cams*416]` row the softmax needs was a TILE reshape moving
+  every element, 139 us x 6 layers = 0.81 ms/frame
+- Instead the operands are built wide — rows `[f|f|f] + [c0|c1|c2]` — against a
+  block-diagonal copy of the weight, so the linear emits the folded row itself.
+  Same bytes materialised, and 3x the MACs priced at zero: the matmul measured
+  75.7 -> 71.4 us/call because setup, not FLOPs, dominates at this size
+- Net -0.68 ms/frame (tilize of the wider rows gives back 0.48 of the 1.16 saved).
+  Device kernel total 66.61 -> 65.93 ms/frame, wall median 68.6 ms (14.59 FPS over
+  4250 samples). Full val bit-identical — off-diagonal zeros add exact 0.0 into the
+  fp32 accumulator
 
 **`93f3f3f` — parallelise `grid_compact`, store the grid as Q14 fixed point**
 
@@ -103,6 +172,29 @@ Two things were deliberately left alone, both for numerical reasons:
 Accuracy across the two stages: mAP 0.44756 -> 0.44733 -> **0.44802**, i.e. unchanged. The
 cost is localisation only — **mATE 0.5532 -> 0.5620** — because the projection is now bf16
 tile matmuls rather than software fp32. `TT_KPS_TILE=0` restores the fp32 path.
+
+**`fe6c89a` — materialise the camera-embed add instead of broadcasting it**
+
+- The broadcast form put 1 and 3 in the tile axis, which pads to 32: a 1.3 MB result
+  computed through a 14 MB intermediate, 91% padding. reshape + add + reshape = 3.93
+  ms/frame
+- repeat_interleave + repeat + plain add: every axis tile-aligned, 882 -> 515 us/call
+- Full val bit-identical (same pairs summed in the same order); 77.7 -> 75.4 ms
+
+**`5cbe641` / `2c9f9f9` — grid_precompute: grid_sample's coordinate math on Tensix**
+
+- The sampler's reader derived pixel indices and bilinear weights per point in soft float
+  on an FPU-less core — 62% of the op. A new op computes the 6-field precomputed form
+  after compaction (SFPU for all values, FPU only for 0/1 selector routing) and
+  grid_sample consumes it with `use_precomputed_grid=True`
+- The op itself took four measured rounds to get cheap (948 -> 518 us/call): resident
+  constants (68 DMA barriers -> 1), hardware format conversion (packer/SFPU instead of
+  soft-float casts, was 682 us), removing a `c % 6` these dividerless cores turned into a
+  library call, and FIELD-MAJOR output rows so the writer copies contiguous runs
+- Full val: mAP 0.44802 -> **0.44877**, DFA PCC identical at 0.999830 either way.
+  Latency 75.63 -> **71.66 ms** (13.96 FPS). `TT_GRID_PRECOMP=0` restores the reader math
+- What remains in the op is mostly per-call fixed cost: kernel 251 us vs FW+dispatch 267
+  us, so further kernel work is capped at ~0.6 ms/frame and was left on the table
 
 ### Rejected by measurement
 

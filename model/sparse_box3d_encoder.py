@@ -162,8 +162,10 @@ class SparseBox3DEncoder:
         """Run Linear+ReLU (→LN) chain with fused activation."""
         for idx, entry in enumerate(layers):
             linear_in = x
+            # core_grid makes the relu a REAL fused epilogue (see refinement_module).
             x = ttnn.linear(x, entry["weight"], bias=entry["bias"],
                             activation="relu",
+                            core_grid=ttnn.CoreGrid(y=8, x=8),
                             compute_kernel_config=self._hifi_compute_config)
             if idx > 0:
                 ttnn.deallocate(linear_in)

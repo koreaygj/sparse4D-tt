@@ -119,8 +119,12 @@ class SparseBox3DRefinementModule:
         for idx, entry in enumerate(layers):
             linear_in = x
             # Fused linear+relu: single op instead of two
+            # core_grid makes the relu a REAL fused epilogue: without a user core
+            # grid, matmul runs `activation` as a separate unary op afterwards
+            # (matmul.cpp: user_fused_activation && !user_core_coord).
             x = ttnn.linear(x, entry["weight"], bias=entry["bias"],
                             activation="relu",
+                            core_grid=ttnn.CoreGrid(y=8, x=8),
                             compute_kernel_config=self._hifi_compute_config)
             if "ln_weight" in entry:
                 ln_in = x

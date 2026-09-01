@@ -26,6 +26,19 @@ import ttnn
 # TT_CUSTOM_KERNELS=0 → force pure ttnn, TT_CUSTOM_KERNELS=1 → force custom kernels
 import os as _os
 _KERNELS_AVAILABLE = all(hasattr(ttnn, op) for op in ["kps_project_fused", "transposed_s2i", "grouped_weighted_sum"])
+
+# Dead-pair skip for grouped_weighted_sum: anchors bucketed by camera
+# visibility (anchor_bucket) so the gws reader can skip the ~75-80% of
+# (tile-row, clp) iterations whose weights the mask zeroed anyway. Ablation
+# measured gws time linear in clp iterations (1003/451/238 us at 156/78/40),
+# so the skip converts ~1:1. Output is bit-identical: every skipped term is
+# exactly 0.0. PARKED (TT_GWS_SKIP=1 opts in): bit-identical but slower —
+# the permuted stick reads lose DRAM locality and the surviving 31% of
+# iterations run ~3x slower, erasing the win (see CHANGELOG 2026-08-19).
+_GWS_SKIP = (
+    all(hasattr(ttnn, op) for op in ["anchor_bucket", "row_gather"])
+    and _os.environ.get("TT_GWS_SKIP", "0") == "1"
+)
 _env = _os.environ.get("TT_CUSTOM_KERNELS")
 if _env is not None:
     _HAS_CUSTOM_KERNELS = _env == "1"
@@ -105,6 +118,14 @@ else:
 #
 # TT_KPS_TILE=0 restores the fp32 path when localisation accuracy matters more than latency.
 _KPS_TILE = _os.environ.get("TT_KPS_TILE", "1") == "1"
+
+# Feed grid_sample the precomputed 6-field grid built on-device by ttnn.grid_precompute
+# instead of Q14 coordinates the reader decodes in soft float. The reader's coordinate
+# math measured ~62% of grid_sample; feeding it the precomputed form took the frame
+# 75.63 -> 71.66 ms. Full val, 6019 samples: mAP 0.44802 -> 0.44877, NDS 0.5520 ->
+# 0.5523, DFA output PCC identical at 0.999830 — on by default on that evidence.
+# TT_GRID_PRECOMP=0 restores the in-reader coordinate math.
+_GRID_PRECOMP = _os.environ.get("TT_GRID_PRECOMP", "1") == "1"
 
 # Anchor box field indices (Sparse4D convention)
 X, Y, Z = 0, 1, 2
@@ -259,6 +280,18 @@ class DeformableFeatureAggregation:
         self._grid_precomputed_sharded_mem = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec_precomputed
         )
+        # Same width, but at the COMPACTED row count — the precomputed grids are produced
+        # from cgrid, so their shard height must line up with the bidx shard the way the
+        # Q14 grid's does.
+        self._cgrid_precomp_sharded_mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                _core_grid, (_cshard_h, _padded_precomputed), ttnn.ShardOrientation.ROW_MAJOR
+            ),
+        )
+        self._gp_consts = None
+        self._gp_out = None
 
         # Pre-allocate scalar constants on device (reused per camera in _project_points)
         _skw = dict(layout=ttnn.TILE_LAYOUT, device=self.device, dtype=ttnn.bfloat16)
@@ -303,6 +336,21 @@ class DeformableFeatureAggregation:
         self.weights_fc_bias = self._to_device_bias(
             parameters["weights_fc_bias"]
         )  # [1,1,1,416]
+
+        if use_camera_embed:
+            # Block-diagonal copy of weights_fc: linear([f|f|f] + [c0|c1|c2]) then
+            # emits the folded [N, cams*416] row directly, replacing the TILE reshape
+            # [N*cams, 416] -> [N, cams*416] after the linear. The off-diagonal zeros
+            # add exact 0.0 into the fp32 accumulator, so the outputs are unchanged.
+            w = parameters["weights_fc_weight"].t()  # [256, 416]
+            d_in, d_out = w.shape
+            wbd = torch.zeros(num_cams * d_in, num_cams * d_out, dtype=w.dtype)
+            for c in range(num_cams):
+                wbd[c * d_in : (c + 1) * d_in, c * d_out : (c + 1) * d_out] = w
+            self.weights_fc_weight_bd = self._to_device(wbd)  # [768, 1248]
+            self.weights_fc_bias_bd = self._to_device_bias(
+                parameters["weights_fc_bias"].repeat(num_cams)
+            )  # [1,1,1,1248]
 
         # Output projection
         self.output_proj_weight = self._to_device(
@@ -784,57 +832,51 @@ class DeformableFeatureAggregation:
                 or self._cached_camera_embed is None
             ):
                 self._cached_camera_embed = self._camera_encoder(projection_mat, bs)
-            camera_embed = self._cached_camera_embed
-            # Materialise both operands at [1, 1, N*nc, C] instead of letting a broadcast
-            # do it from [N, 1, C] and [1, nc, C].
-            #
-            # The broadcast form is the obvious one and it is the expensive one: 1 and nc
-            # land in the tile axis, which pads to 32, so a 1.3 MB answer is computed
-            # through a 14 MB intermediate — 91% of the tiles carry nothing. Profiled, the
-            # reshape in, the add and the reshape out came to 3.93 ms/frame between them.
-            #
-            # repeat_interleave on the anchors and repeat on the cameras cost two extra ops
-            # but leave every axis tile-aligned, and the add itself then has no broadcast.
-            # Measured on the real shapes: 882 -> 515 us per call.
-            #
-            # The row order is load-bearing. repeat_interleave gives anchor-major and repeat
-            # cycles the cameras fastest, which is exactly the (anchor, camera) ordering the
-            # reshape after the linear relies on to read clp = cam*L*K + level*K + point.
+                # Row form [1,1,1,nc*C] for the block-diagonal linear below; tiny
+                # TILE reshape, paid once per frame alongside the encoder.
+                self._cached_camera_row = ttnn.reshape(
+                    self._cached_camera_embed,
+                    (1, 1, 1, self.num_cams * self.embed_dims),
+                )
+            # Build the operands wide instead of tall: [N, nc*C] rows [f|f|f] and
+            # [c0|c1|c2]. Same bytes as the old [N*nc, C] materialisation (the
+            # broadcast form was rejected earlier — 1 and nc land in the tile axis
+            # and pad to 32, computing a 1.3 MB answer through a 14 MB
+            # intermediate), but with the camera in the COLUMNS the linear against
+            # the block-diagonal weights_fc emits the folded [N, cams*L*K*G] row
+            # directly and the TILE reshape that followed the linear disappears.
             feat_flat = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
-            cam_flat = ttnn.reshape(camera_embed, (1, 1, self.num_cams, self.embed_dims))
-            f_rep = ttnn.repeat_interleave(feat_flat, self.num_cams, dim=2)
-            c_rep = ttnn.repeat(cam_flat, ttnn.Shape([1, 1, bs * num_anchor, 1]))
+            f_rep = ttnn.repeat(feat_flat, ttnn.Shape([1, 1, 1, self.num_cams]))
+            c_rep = ttnn.repeat(
+                self._cached_camera_row, ttnn.Shape([1, 1, bs * num_anchor, 1])
+            )
             feature = ttnn.add(f_rep, c_rep)
             ttnn.deallocate(f_rep)
             ttnn.deallocate(c_rep)
             # Don't deallocate camera_embed — it's cached for reuse
+
+            # Column index is cam*(L*K*G) + (level*K + point)*G + g: the camera
+            # block comes from the weight's block column, the rest from the
+            # linear's own column order — the clp*G + g ordering the feature
+            # buffer and the mask already use.
+            weights = ttnn.linear(
+                feature,
+                self.weights_fc_weight_bd,
+                bias=self.weights_fc_bias_bd,
+                compute_kernel_config=self._hifi_compute_config,
+            )
+            ttnn.deallocate(feature)
         else:
             feature = ttnn.reshape(feature, (1, 1, bs * num_anchor, self.embed_dims))
-
-        weights = ttnn.linear(
-            feature,
-            self.weights_fc_weight,
-            bias=self.weights_fc_bias,
-            compute_kernel_config=self._hifi_compute_config,
-        )
-
-        ttnn.deallocate(feature)
+            weights = ttnn.linear(
+                feature,
+                self.weights_fc_weight,
+                bias=self.weights_fc_bias,
+                compute_kernel_config=self._hifi_compute_config,
+            )
+            ttnn.deallocate(feature)
 
         total_clp = self.num_cams * self.num_levels * self.num_pts
-        if self.use_camera_embed:
-            # [1, 1, bs*N, CLP*G]. The camera came from the row axis and the linear's
-            # columns are (level, point, group), so the merged column index is exactly
-            # clp*G + g with clp = cam*L*K + level*K + point — the ordering the feature
-            # buffer and the mask both already use.
-            weights = ttnn.reshape(
-                weights,
-                (
-                    1,
-                    1,
-                    bs * num_anchor,
-                    self.num_cams * self.num_levels * self.num_pts * self.num_groups,
-                ),
-            )
 
         # Only the camera-embed path produces the compact layout for free: without it the
         # linear has no camera axis to fold into the columns, so CLP*G would not be the
@@ -981,6 +1023,76 @@ class DeformableFeatureAggregation:
         ttnn.deallocate(weights)
         return out
 
+    def _run_grid_precompute(self, spatial_shapes):
+        """Turn the compacted Q14 grid into per-level precomputed grids, on device.
+
+        The constant pack (per-level affine/bound tiles plus the selector matrices that
+        route factors into the FIELD-MAJOR output columns) is built once here and reused —
+        building it in the kernel was priced at ~0.6 ms/frame, a DMA of the same tiles is
+        microseconds. The ordering and the field-major column map are contracts shared
+        with the op's reader kernel and with grid_sample's precomputed decode; the
+        authoritative copy of both lives in those kernels' comments.
+        """
+        K = self.num_pts
+        if self._gp_consts is None:
+            NL = len(spatial_shapes)
+            OT = (K * 6 + 31) // 32
+            tiles = []
+            for h, w in spatial_shapes:            # SCALE_l
+                t = torch.zeros(32, 32)
+                for pt in range(K):
+                    t[:, 2 * pt] = w / 32768.0
+                    t[:, 2 * pt + 1] = h / 32768.0
+                tiles.append(t)
+            for h, w in spatial_shapes:            # BIAS_l
+                t = torch.zeros(32, 32)
+                for pt in range(K):
+                    t[:, 2 * pt] = w / 2.0 - 0.5
+                    t[:, 2 * pt + 1] = h / 2.0 - 0.5
+                tiles.append(t)
+            for h, w in spatial_shapes:            # C_l
+                t = torch.zeros(32, 32)
+                for pt in range(K):
+                    t[:, 2 * pt] = w - 1
+                    t[:, 2 * pt + 1] = h - 1
+                tiles.append(t)
+            sel = [torch.zeros(32, 32) for _ in range(5 * OT)]
+            for pt in range(K):
+                for f, kind, src in (
+                    (2, 0, 2 * pt), (4, 0, 2 * pt),          # SB0: b0 -> nw, sw
+                    (3, 1, 2 * pt), (5, 1, 2 * pt),          # SB1: b1 -> ne, se
+                    (2, 2, 2 * pt + 1), (3, 2, 2 * pt + 1),  # SH0: a0 -> nw, ne
+                    (4, 3, 2 * pt + 1), (5, 3, 2 * pt + 1),  # SH1: a1 -> sw, se
+                    (0, 4, 2 * pt + 1), (1, 4, 2 * pt),      # SI: h0 <- y, w0 <- x
+                ):
+                    g = f * K + pt                           # field-major column
+                    sel[5 * (g // 32) + kind][src, g % 32] = 1.0
+            tiles += sel
+            _kw = dict(device=self.device)
+            if self._mesh_device is not None:
+                _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            self._gp_consts = ttnn.from_torch(
+                torch.stack(tiles).reshape(1, 1, -1, 32),
+                dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, **_kw,
+            )
+            self._gp_out = [
+                ttnn.from_torch(
+                    torch.zeros(1, self._oob_cap, 1, K * 6),
+                    dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG, **_kw,
+                )
+                for _ in range(NL)
+            ]
+
+        ttnn.grid_precompute(
+            self._cgrid, self._gp_consts,
+            self._gp_out[0], self._gp_out[1], self._gp_out[2], self._gp_out[3],
+            num_pts=K,
+        )
+        return [
+            ttnn.to_memory_config(o, self._cgrid_precomp_sharded_mem) for o in self._gp_out
+        ]
+
     def _compact_grid(self, points_2d, n, nc, spatial_shapes):
         """Compact the sampling grid to the rows that actually hit an image.
 
@@ -1024,6 +1136,42 @@ class DeformableFeatureAggregation:
                 torch.zeros(1, 1, self._oob_cap, 8, dtype=torch.int32),
                 dtype=ttnn.uint32, **_kw,
             )
+            if _GWS_SKIP:
+                npad = ((n + 31) // 32) * 32
+                self._ab_perm = ttnn.from_torch(
+                    torch.zeros(1, 1, 1, npad, dtype=torch.int32), dtype=ttnn.uint32, **_kw)
+                self._ab_inv = ttnn.from_torch(
+                    torch.zeros(1, 1, 1, npad, dtype=torch.int32), dtype=ttnn.uint32, **_kw)
+                self._ab_live = ttnn.from_torch(
+                    torch.zeros(1, 1, 1, 32, dtype=torch.int32), dtype=ttnn.uint32, **_kw)
+                # weights permuted into sorted-anchor order, once per gws call —
+                # the reader then reads them tile-cached like the non-skip path
+                _wkw = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                            device=self.device)
+                if self._mesh_device is not None:
+                    _wkw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                self._wt_perm = ttnn.from_torch(
+                    torch.zeros(n, nc * self.num_levels * self.num_pts
+                                * self.num_groups), **_wkw)
+                self._gws_unperm = None  # lazy: matches the fused feature shape
+                # Count mailbox: L1-sharded so every core's 32-word shard sits
+                # at ONE base address the kernels get as a plain runtime arg —
+                # the MATH thread has no cb_interface, so a CB cannot carry it.
+                _grid = self.device.compute_with_storage_grid_size()
+                _mbox_shard = ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(
+                            ttnn.CoreCoord(0, 0),
+                            ttnn.CoreCoord(_grid.x - 1, _grid.y - 1))}),
+                        [1, 32], ttnn.ShardOrientation.ROW_MAJOR))
+                _mkw = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device,
+                            memory_config=_mbox_shard)
+                if self._mesh_device is not None:
+                    _mkw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                self._gws_mbox = ttnn.from_torch(
+                    torch.zeros(1, 1, _grid.x * _grid.y, 32, dtype=torch.int32),
+                    dtype=ttnn.uint32, **_mkw)
 
         # With align_corners=False a point contributes iff g is in [-1 - 1/S, 1 + 1/S),
         # S being W on x and H on y. Take the loosest LEVEL so one compaction serves all
@@ -1036,6 +1184,9 @@ class DeformableFeatureAggregation:
             num_pts=self.num_pts, capacity=self._oob_cap, anchors=n,
             threshold_x=thr_x, threshold_y=thr_y, bidx=self._cbidx,
         )
+        if _GWS_SKIP:
+            ttnn.anchor_bucket(self._cflags, self._ab_perm, self._ab_inv,
+                               self._ab_live, num_anchors=n)
         return (
             ttnn.to_memory_config(self._cgrid, self._cgrid_sharded_mem),
             ttnn.to_memory_config(self._cbidx, self._cbidx_sharded_mem),
@@ -1155,8 +1306,12 @@ class DeformableFeatureAggregation:
                 points_2d_sh, bidx_sh = self._compact_grid(
                     points_2d, n, nc, spatial_shapes
                 )
+                gp_grids = (
+                    self._run_grid_precompute(spatial_shapes) if _GRID_PRECOMP else None
+                )
             else:
                 points_2d_sh = ttnn.to_memory_config(points_2d, self._grid_sharded_mem)
+                gp_grids = None
             ttnn.deallocate(points_2d)
 
             if _WT_COMPACT and self.use_camera_embed:
@@ -1172,10 +1327,20 @@ class DeformableFeatureAggregation:
                     weights_t = self._mask_weights(weights_t, n, nc)
 
             for level_idx, fm_tt in enumerate(feature_maps):
-                sampled = ttnn.grid_sample(
-                    fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False,
-                    batch_index=bidx_sh,
-                )
+                if gp_grids is not None:
+                    # Per-level precomputed grid: pixel indices and masked bilinear
+                    # weights already computed on the Tensix engines, so the reader
+                    # skips its ~928-cycle soft-float coordinate math per point.
+                    sampled = ttnn.grid_sample(
+                        fm_tt, gp_grids[level_idx], padding_mode="zeros",
+                        align_corners=False, use_precomputed_grid=True,
+                        batch_index=bidx_sh,
+                    )
+                else:
+                    sampled = ttnn.grid_sample(
+                        fm_tt, points_2d_sh, padding_mode="zeros", align_corners=False,
+                        batch_index=bidx_sh,
+                    )
                 ttnn.transposed_s2i(
                     sampled, self._rearrange_buf,
                     num_cams=nc, num_pts=self.num_pts, num_anchors=n,
@@ -1184,6 +1349,9 @@ class DeformableFeatureAggregation:
                     capacity=self._oob_cap if _OOB_COMPACT else 0,
                 )
             ttnn.deallocate(points_2d_sh)
+            if gp_grids is not None:
+                for g in gp_grids:
+                    ttnn.deallocate(g)
             if bidx_sh is not None:
                 ttnn.deallocate(bidx_sh)
 
@@ -1192,10 +1360,20 @@ class DeformableFeatureAggregation:
             # 137 MB DRAM round trip per call — is not needed. RM_MODE is only correct
             # with the kernel fix that configures both compute pipelines before the loop;
             # without it the op is wrong on its first call after any other op has run.
-            gws_out = ttnn.grouped_weighted_sum(
-                self._rearrange_buf, weights_t,
-                num_groups=self.num_groups, group_dims=self.group_dims,
-            )
+            if _GWS_SKIP:
+                ttnn.row_gather(weights_t, self._ab_perm, self._wt_perm, k=n)
+                gws_out = ttnn.grouped_weighted_sum(
+                    self._rearrange_buf, self._wt_perm,
+                    num_groups=self.num_groups, group_dims=self.group_dims,
+                    perm=self._ab_perm, live=self._ab_live,
+                    clp_per_cam=self.num_levels * self.num_pts,
+                    mbox=self._gws_mbox,
+                )
+            else:
+                gws_out = ttnn.grouped_weighted_sum(
+                    self._rearrange_buf, weights_t,
+                    num_groups=self.num_groups, group_dims=self.group_dims,
+                )
             ttnn.deallocate(weights_t)
             n_padded = ((n + 31) // 32) * 32
             chunk0 = ttnn.slice(gws_out, [0, 0], [n, self.embed_dims])
@@ -1204,6 +1382,18 @@ class DeformableFeatureAggregation:
             features = ttnn.add(chunk0, chunk1)
             ttnn.deallocate(chunk0)
             ttnn.deallocate(chunk1)
+            if _GWS_SKIP:
+                # rows came out in sorted-anchor order; un-permute via inv
+                if self._gws_unperm is None:
+                    _ukw = dict(layout=features.layout, device=self.device,
+                                dtype=features.dtype)
+                    if self._mesh_device is not None:
+                        _ukw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+                    self._gws_unperm = ttnn.from_torch(
+                        torch.zeros(n, self.embed_dims), **_ukw)
+                ttnn.row_gather(features, self._ab_inv, self._gws_unperm, k=n)
+                ttnn.deallocate(features)
+                features = self._gws_unperm
         else:
             # === Fallback path: original pure ttnn ops (from pre-kernel commit bc5e388) ===
             ttnn.deallocate(anchor_rm)

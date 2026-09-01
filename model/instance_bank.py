@@ -13,9 +13,10 @@
 #   update() → merge cached + new instances via topk + mask
 #   cache()  → save top-K instances for next frame
 #
-# All operations on device using ttnn ops.
-# anchor_projection handled on host (per-frame coordinate transform,
-# requires numpy metas) then transferred back to device.
+# All operations on device using ttnn ops. The temporal anchor projection is
+# folded into a single matmul+add against an 11x11 affine built on host from
+# the frame's ego-pose metas — host touches the metas (their birthplace), the
+# device does all the anchor math.
 # =============================================================================
 
 import numpy as np
@@ -26,6 +27,27 @@ import os as _os
 
 # TT_ANCHOR_FP32=0 puts the anchor back in bf16 for an A/B.
 _ANCHOR_DTYPE = ttnn.bfloat16 if _os.environ.get("TT_ANCHOR_FP32") == "0" else ttnn.float32
+
+# Custom top-k kernel. ttnn.topk tile-pads the [1, 900] confidence row to
+# 32 x 928 and bitonic-sorts all 32 rows on one core (1.9 + 2.8 ms/frame between
+# the two calls); topk_select radix-sorts the one real row. TT_TOPK_KERNEL=0
+# falls back to ttnn.topk. Tie order differs from ttnn.topk (ours is torch's
+# lower-index-first), so an A/B against the fallback is not bit-identical on
+# tied confidences.
+_TOPK_KERNEL = (
+    hasattr(ttnn, "topk_select") and _os.environ.get("TT_TOPK_KERNEL", "1") == "1"
+)
+
+# Paired row-gather kernel: one op replaces the two ttnn.gather calls (655
+# us/call on 4 cores, latency-bound) AND the index expansion chain each needed
+# (typecast/reshape/to_layout/repeat_interleave). Consumes topk_select's uint32
+# ROW_MAJOR indices directly, so it requires _TOPK_KERNEL. Bit-identical row
+# copies (verified exact incl. duplicate indices). TT_ROW_GATHER=0 falls back.
+_ROW_GATHER = (
+    _TOPK_KERNEL
+    and hasattr(ttnn, "row_gather")
+    and _os.environ.get("TT_ROW_GATHER", "1") == "1"
+)
 
 # Anchor box field indices
 X, Y, Z = 0, 1, 2
@@ -77,7 +99,41 @@ class InstanceBank:
         self._dev_anchor = self._to_dev(anchor_tiled, _ANCHOR_DTYPE)
         self._dev_feature = self._to_dev(feature_tiled)
 
+        # Persistent output buffers for topk_select, one (values, indices) pair
+        # per k. The op writes every slot on every call, so reuse is safe.
+        self._topk_bufs = {}
+        # Persistent (features, anchors) output pair per k for row_gather.
+        self._rg_bufs = {}
+
         self.reset()
+
+    def _topk_out(self, k: int):
+        buf = self._topk_bufs.get(k)
+        if buf is None:
+            kw = dict(device=self.device, layout=ttnn.ROW_MAJOR_LAYOUT)
+            if self._mesh_device is not None:
+                kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            vals = ttnn.from_torch(
+                torch.zeros(1, 1, 1, k), dtype=ttnn.bfloat16, **kw)
+            idxs = ttnn.from_torch(
+                torch.zeros(1, 1, 1, k, dtype=torch.int32), dtype=ttnn.uint32, **kw)
+            buf = (vals, idxs)
+            self._topk_bufs[k] = buf
+        return buf
+
+    def _rg_out(self, k: int):
+        buf = self._rg_bufs.get(k)
+        if buf is None:
+            kw = dict(layout=ttnn.TILE_LAYOUT, device=self.device)
+            if self._mesh_device is not None:
+                kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
+            feat = ttnn.from_torch(
+                torch.zeros(1, k, self.embed_dims), dtype=ttnn.bfloat16, **kw)
+            anch = ttnn.from_torch(
+                torch.zeros(1, k, 11), dtype=_ANCHOR_DTYPE, **kw)
+            buf = (feat, anch)
+            self._rg_bufs[k] = buf
+        return buf
 
     def _to_dev(self, tensor: torch.Tensor, dtype=None) -> ttnn.Tensor:
         """Helper: from_torch with mesh_mapper if mesh mode."""
@@ -144,37 +200,41 @@ class InstanceBank:
             if self._mesh_device is not None:
                 _kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self._mesh_device)
 
-            anc = self.cached_anchor
-            nt = anc.shape[1]
-            neg_ti_bf = (-time_interval_pt).reshape(bs, 1, 1).bfloat16()
-            ti_tt = ttnn.from_torch(neg_ti_bf, **_kw)
-            vel = ttnn.slice(anc, [0, 0, VX], [bs, nt, VZ + 1])
-            center = ttnn.slice(anc, [0, 0, X], [bs, nt, Z + 1])
-            translation = ttnn.multiply(vel, ti_tt)
-            center = ttnn.subtract(center, translation)
-            ttnn.deallocate(translation); ttnn.deallocate(ti_tt)
+            # Every projected field is LINEAR in the anchor fields:
+            #   center' = (center - ti_used*vel) @ R^T + t
+            #   size'   = size
+            #   yaw'    = [cos, sin] @ R22^T   (written back [cos', sin'] into the
+            #             (SIN, COS) slots — the upstream Sparse4D swap, preserved
+            #             for checkpoint compatibility)
+            #   vel'    = vel @ R^T
+            # so the whole projection folds into ONE anchor @ A + b. The previous
+            # form spelled it out as 13 device ops with 4 h2d uploads per frame;
+            # host dispatch is the frame's scarce resource and a trace capture
+            # needs the op stream minimal and static, so A and b (two tiny
+            # constants) are built on host instead. ti_used = -dt, matching the
+            # original InstanceBank's anchor_projection(-time_interval) call.
+            Tm = T_temp2cur_pt.float()           # bf16-rounded, as uploaded before
+            RT = Tm[:, :3, :3].transpose(-1, -2)
+            ti_used = (-time_interval_pt).bfloat16().float().reshape(bs, 1, 1)
+            A = torch.zeros(bs, 11, 11)
+            b = torch.zeros(bs, 1, 11)
+            A[:, X : Z + 1, X : Z + 1] = RT
+            A[:, VX:, X : Z + 1] = -ti_used * RT
+            b[:, 0, X : Z + 1] = Tm[:, :3, 3]
+            for d in (W, L, H):
+                A[:, d, d] = 1.0
+            R22T = Tm[:, :2, :2].transpose(-1, -2)
+            A[:, COS_YAW, SIN_YAW] = R22T[:, 0, 0]  # col SIN receives cos'
+            A[:, SIN_YAW, SIN_YAW] = R22T[:, 1, 0]
+            A[:, COS_YAW, COS_YAW] = R22T[:, 0, 1]  # col COS receives sin'
+            A[:, SIN_YAW, COS_YAW] = R22T[:, 1, 1]
+            A[:, VX:, VX:] = RT
 
-            R33_T_pt = T_temp2cur_pt[:,:3,:3].transpose(-1,-2).contiguous()
-            R33_T = ttnn.from_torch(R33_T_pt, **_kw)
-            t3 = ttnn.from_torch(T_temp2cur_pt[:,:3,3].reshape(bs,1,3).contiguous(), **_kw)
-            center = ttnn.matmul(center, R33_T)
-            center = ttnn.add(center, t3); ttnn.deallocate(t3)
-
-            cos_yaw = ttnn.slice(anc, [0,0,COS_YAW], [bs,nt,COS_YAW+1])
-            sin_yaw = ttnn.slice(anc, [0,0,SIN_YAW], [bs,nt,SIN_YAW+1])
-            yaw_cs = ttnn.concat([cos_yaw, sin_yaw], dim=-1)
-            ttnn.deallocate(cos_yaw); ttnn.deallocate(sin_yaw)
-            R22_T = ttnn.from_torch(T_temp2cur_pt[:,:2,:2].transpose(-1,-2).contiguous(), **_kw)
-            yaw_out = ttnn.matmul(yaw_cs, R22_T); ttnn.deallocate(yaw_cs)
-
-            # Reuse R33_T for velocity rotation (same matrix, was uploaded twice before)
-            vel_out = ttnn.matmul(vel, R33_T)
-            ttnn.deallocate(vel); ttnn.deallocate(R33_T); ttnn.deallocate(R22_T)
-
-            size = ttnn.slice(anc, [0,0,W], [bs,nt,H+1])
-            cached_anchor = ttnn.concat([center, size, yaw_out, vel_out], dim=-1)
-            ttnn.deallocate(center); ttnn.deallocate(size)
-            ttnn.deallocate(yaw_out); ttnn.deallocate(vel_out)
+            A_tt = ttnn.from_torch(A, **_kw)
+            b_tt = ttnn.from_torch(b, **_kw)
+            cached_anchor = ttnn.matmul(self.cached_anchor, A_tt)
+            cached_anchor = ttnn.add(cached_anchor, b_tt)
+            ttnn.deallocate(A_tt); ttnn.deallocate(b_tt)
             self.cached_anchor = self._as_bank_dtype(cached_anchor)
 
             time_interval_pt = torch.where(
@@ -238,26 +298,43 @@ class InstanceBank:
         conf_max = ttnn.max(confidence, dim=-1, keepdim=True)
         conf_max_2d = ttnn.reshape(conf_max, (bs, self.num_anchor))
         ttnn.deallocate(conf_max)
-        _, top_idx_flat = ttnn.topk(conf_max_2d, N, dim=-1)
-        ttnn.deallocate(conf_max_2d)
-        top_idx_flat = ttnn.typecast(top_idx_flat, ttnn.uint32)
-        top_idx = ttnn.reshape(top_idx_flat, (bs, N, 1))
-        top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
-        ttnn.deallocate(top_idx_flat)
+        if _TOPK_KERNEL:
+            val_buf, idx_buf = self._topk_out(N)
+            ttnn.topk_select(conf_max_2d, val_buf, idx_buf, N)
+            ttnn.deallocate(conf_max_2d)
+            if _ROW_GATHER:
+                top_idx = None   # row_gather eats idx_buf directly
+            else:
+                # Persistent buffer: reshape to a fresh view, never deallocated here.
+                top_idx = ttnn.reshape(idx_buf, (bs, N, 1))
+                top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+        else:
+            _, top_idx_flat = ttnn.topk(conf_max_2d, N, dim=-1)
+            ttnn.deallocate(conf_max_2d)
+            top_idx_flat = ttnn.typecast(top_idx_flat, ttnn.uint32)
+            top_idx = ttnn.reshape(top_idx_flat, (bs, N, 1))
+            top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(top_idx_flat)
 
-        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
-        selected_feature = ttnn.gather(instance_feature, 1, idx_feat)
-        ttnn.deallocate(idx_feat)
+        if _ROW_GATHER:
+            selected_feature, selected_anchor = self._rg_out(N)
+            ttnn.row_gather(instance_feature, idx_buf, selected_feature,
+                            src_b=anchor, out_b=selected_anchor, k=N)
+        else:
+            idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+            selected_feature = ttnn.gather(instance_feature, 1, idx_feat)
+            ttnn.deallocate(idx_feat)
 
-        anch_dim = anchor.shape[-1]
-        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
-        selected_anchor = ttnn.gather(anchor, 1, idx_anch)
-        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
+            anch_dim = anchor.shape[-1]
+            idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+            selected_anchor = ttnn.gather(anchor, 1, idx_anch)
+            ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
         # Device concat
         merged_feature = ttnn.concat([self.cached_feature, selected_feature], dim=1)
         merged_anchor = ttnn.concat([self.cached_anchor, selected_anchor], dim=1)
-        ttnn.deallocate(selected_feature); ttnn.deallocate(selected_anchor)
+        if not _ROW_GATHER:
+            ttnn.deallocate(selected_feature); ttnn.deallocate(selected_anchor)
 
         if self.mask.all():
             instance_feature = merged_feature
@@ -327,21 +404,40 @@ class InstanceBank:
 
         # Device topk + gather
         K = self.num_temp_instances
-        top_conf, top_idx_flat = ttnn.topk(conf_scores, K, dim=-1)
-        ttnn.deallocate(conf_scores)
-        top_idx_flat = ttnn.typecast(top_idx_flat, ttnn.uint32)
-        top_idx = ttnn.reshape(top_idx_flat, (bs, K, 1))
-        top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
-        ttnn.deallocate(top_idx_flat)
+        if _TOPK_KERNEL:
+            val_buf, idx_buf = self._topk_out(K)
+            ttnn.topk_select(conf_scores, val_buf, idx_buf, K)
+            ttnn.deallocate(conf_scores)
+            # Downstream (decay multiply next frame) works on TILE.
+            top_conf = ttnn.to_layout(val_buf, ttnn.TILE_LAYOUT)
+            if _ROW_GATHER:
+                top_idx = None
+            else:
+                top_idx = ttnn.reshape(idx_buf, (bs, K, 1))
+                top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+        else:
+            top_conf, top_idx_flat = ttnn.topk(conf_scores, K, dim=-1)
+            ttnn.deallocate(conf_scores)
+            top_idx_flat = ttnn.typecast(top_idx_flat, ttnn.uint32)
+            top_idx = ttnn.reshape(top_idx_flat, (bs, K, 1))
+            top_idx = ttnn.to_layout(top_idx, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(top_idx_flat)
 
-        idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
-        self.cached_feature = ttnn.gather(instance_feature, 1, idx_feat)
-        ttnn.deallocate(idx_feat)
+        if _ROW_GATHER:
+            feat_buf, anch_buf = self._rg_out(K)
+            ttnn.row_gather(instance_feature, idx_buf, feat_buf,
+                            src_b=self._as_bank_dtype(anchor), out_b=anch_buf, k=K)
+            self.cached_feature = feat_buf
+            self.cached_anchor = anch_buf
+        else:
+            idx_feat = ttnn.repeat_interleave(top_idx, self.embed_dims, dim=-1)
+            self.cached_feature = ttnn.gather(instance_feature, 1, idx_feat)
+            ttnn.deallocate(idx_feat)
 
-        anch_dim = anchor.shape[-1]
-        idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
-        self.cached_anchor = ttnn.gather(self._as_bank_dtype(anchor), 1, idx_anch)
-        ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
+            anch_dim = anchor.shape[-1]
+            idx_anch = ttnn.repeat_interleave(top_idx, anch_dim, dim=-1)
+            self.cached_anchor = ttnn.gather(self._as_bank_dtype(anchor), 1, idx_anch)
+            ttnn.deallocate(idx_anch); ttnn.deallocate(top_idx)
 
         self.confidence = ttnn.reshape(top_conf, (1, 1, bs, K))
 

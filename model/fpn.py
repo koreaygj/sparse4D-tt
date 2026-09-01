@@ -196,6 +196,9 @@ class FPN:
 
             x = laterals[i]
             x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
+            # conv2d's slice path reshapes flat->NHWC internally; on TILE that
+            # materialises (~885us at level 0), on ROW_MAJOR it is a free view.
+            x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
 
             total_rows = self.batch_size * h * w
             use_sharding = total_rows >= 128
@@ -205,6 +208,9 @@ class FPN:
                     ttnn.TensorMemoryLayout.HEIGHT_SHARDED if use_sharding else None
                 ),
                 reshard_if_not_optimal=True,
+                # DFA consumes these as ROW_MAJOR NHWC; RM out also turns the slice-mode
+                # epilogue reshape (4D->flat, ~868us at level 0) into a view.
+                output_layout=ttnn.ROW_MAJOR_LAYOUT,
             )
 
             [x, [out_h, out_w], [self.fpn_weights[i], self.fpn_biases[i]]] = (
