@@ -29,6 +29,8 @@ cp -r tt-metal/ops/transposed_s2i ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/grid_compact ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/grid_precompute ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 cp -r tt-metal/ops/topk_select ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
+cp -r tt-metal/ops/row_gather ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
+cp -r tt-metal/ops/anchor_bucket ~/tt-metal/ttnn/cpp/ttnn/operations/pool/
 ```
 
 `grid_sample` is an **upstream** op, patched rather than added — it gains an optional
@@ -52,6 +54,8 @@ Add to `file(GLOB_RECURSE kernels ...)`:
     grid_compact/device/kernels/*
     grid_precompute/device/kernels/*
     topk_select/device/kernels/*
+    row_gather/device/kernels/*
+    anchor_bucket/device/kernels/*
 ```
 
 Add to `target_sources(ttnn_op_pool PRIVATE ...)`:
@@ -74,6 +78,12 @@ Add to `target_sources(ttnn_op_pool PRIVATE ...)`:
     topk_select/topk_select.cpp
     topk_select/device/topk_select_device_operation.cpp
     topk_select/device/topk_select_program_factory.cpp
+    row_gather/row_gather.cpp
+    row_gather/device/row_gather_device_operation.cpp
+    row_gather/device/row_gather_program_factory.cpp
+    anchor_bucket/anchor_bucket.cpp
+    anchor_bucket/device/anchor_bucket_device_operation.cpp
+    anchor_bucket/device/anchor_bucket_program_factory.cpp
 ```
 
 ### 2.3 Register nanobind
@@ -88,6 +98,8 @@ Add to the nanobind source list (near other `pool/` entries):
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/grid_compact/grid_compact_nanobind.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/grid_precompute/grid_precompute_nanobind.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/topk_select/topk_select_nanobind.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/row_gather/row_gather_nanobind.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/anchor_bucket/anchor_bucket_nanobind.cpp
 ```
 
 ### 2.4 Register Python bindings
@@ -102,6 +114,8 @@ Add includes (near other `pool/` includes):
 #include "ttnn/operations/pool/grid_compact/grid_compact_nanobind.hpp"
 #include "ttnn/operations/pool/grid_precompute/grid_precompute_nanobind.hpp"
 #include "ttnn/operations/pool/topk_select/topk_select_nanobind.hpp"
+#include "ttnn/operations/pool/row_gather/row_gather_nanobind.hpp"
+#include "ttnn/operations/pool/anchor_bucket/anchor_bucket_nanobind.hpp"
 ```
 
 Add bind calls in the `m_pool` section (near `grid_sample::bind_grid_sample(m_pool)`):
@@ -112,6 +126,8 @@ Add bind calls in the `m_pool` section (near `grid_sample::bind_grid_sample(m_po
     grid_compact::bind_grid_compact(m_pool);
     grid_precompute::bind_grid_precompute(m_pool);
     topk_select::bind_topk_select(m_pool);
+    row_gather::bind_row_gather(m_pool);
+    anchor_bucket::bind_anchor_bucket(m_pool);
 ```
 
 ### 2.5 Build & Install

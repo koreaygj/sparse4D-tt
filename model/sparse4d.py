@@ -537,23 +537,29 @@ class Sparse4DInference:
         Returns:
             list of FPN feature maps as mesh tensors (sharded by camera)
         """
-        imgs_flat = images.reshape(self.num_cams, 3, 256, 704)
-
-        # Fast upload via persistent device buffer
-        if hasattr(self, '_next_host_input') and self._next_host_input is not None:
-            host_input = self._next_host_input
-            self._next_host_input = None
+        # Double-buffered path: stage_next_images() already packed, uploaded and
+        # re-paged this frame's images while the PREVIOUS frame was computing, so
+        # the whole input pipeline is off this frame's critical path.
+        staged = getattr(self, '_staged_tt_input', None)
+        if staged is not None:
+            tt_input = staged
+            self._staged_tt_input = None
         else:
-            host_input = self._prepare_host_input(images)
+            # Fast upload via persistent device buffer
+            if hasattr(self, '_next_host_input') and self._next_host_input is not None:
+                host_input = self._next_host_input
+                self._next_host_input = None
+            else:
+                host_input = self._prepare_host_input(images)
 
-        if not hasattr(self, '_img_dev_slot') or self._img_dev_slot is None:
-            self._img_dev_slot = ttnn.allocate_tensor_on_device(
-                ttnn.Shape([1, 1, self.UPLOAD_SHAPE[2], self.UPLOAD_SHAPE[3]]),
-                ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, self._mesh_device)
-        ttnn.copy_host_to_device_tensor(host_input, self._img_dev_slot)
-        # Back to the NHWC shape conv2d consumes. Same bytes in the same order, so
-        # this is a re-paging on device (~2 ms) in exchange for 39 ms of h2d.
-        tt_input = ttnn.reshape(self._img_dev_slot, (1, 1, 3 * 256 * 704, 4))
+            if not hasattr(self, '_img_dev_slot') or self._img_dev_slot is None:
+                self._img_dev_slot = ttnn.allocate_tensor_on_device(
+                    ttnn.Shape([1, 1, self.UPLOAD_SHAPE[2], self.UPLOAD_SHAPE[3]]),
+                    ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, self._mesh_device)
+            ttnn.copy_host_to_device_tensor(host_input, self._img_dev_slot)
+            # Back to the NHWC shape conv2d consumes. Same bytes in the same order, so
+            # this is a re-paging on device (~2 ms) in exchange for 39 ms of h2d.
+            tt_input = ttnn.reshape(self._img_dev_slot, (1, 1, 3 * 256 * 704, 4))
 
         # Backbone SPMD: each device processes its 3 cameras
         backbone_features = self.backbone(tt_input)
@@ -580,6 +586,41 @@ class Sparse4DInference:
             fpn_features[level_idx] = f
 
         return fpn_features
+
+    def stage_next_images(self, images: torch.Tensor):
+        """Stage the NEXT frame's images while the device still runs this one.
+
+        Packs on host, enqueues the h2d write and the on-device re-page into
+        the slot the in-flight frame is NOT reading. The write streams while
+        the current frame computes and the re-page fills the frame-boundary
+        idle gap, so the next forward() starts straight at the backbone.
+
+        Slot safety: the alternate slot's last reader is the backbone of the
+        frame BEFORE the one in flight — a full frame of enqueued ops sits
+        between it and this write in the command queue, far deeper than the
+        dispatcher ever runs ahead of the workers.
+        """
+        if not self.mesh_parallel_mode:
+            return
+        host_input = self._prepare_host_input(images)
+        if not hasattr(self, '_img_dev_slots'):
+            self._img_dev_slots = [None, None]
+            self._img_tt_inputs = [None, None]
+            self._img_slot_next = 0
+        slot = self._img_slot_next
+        if self._img_dev_slots[slot] is None:
+            self._img_dev_slots[slot] = ttnn.allocate_tensor_on_device(
+                ttnn.Shape([1, 1, self.UPLOAD_SHAPE[2], self.UPLOAD_SHAPE[3]]),
+                ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, self._mesh_device)
+        ttnn.copy_host_to_device_tensor(host_input, self._img_dev_slots[slot])
+        # the re-page output staged into this slot two frames ago was consumed
+        # by that frame's backbone; free it before allocating this frame's
+        if self._img_tt_inputs[slot] is not None:
+            ttnn.deallocate(self._img_tt_inputs[slot])
+        self._img_tt_inputs[slot] = ttnn.reshape(
+            self._img_dev_slots[slot], (1, 1, 3 * 256 * 704, 4))
+        self._staged_tt_input = self._img_tt_inputs[slot]
+        self._img_slot_next = 1 - slot
 
     def reset(self):
         """Reset temporal state (call at start of new sequence)."""
